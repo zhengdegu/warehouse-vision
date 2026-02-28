@@ -1,0 +1,17 @@
+__pycache__
+*.pyc
+.pytest_cache
+.kiro
+.vscode
+.git
+node_modules
+web/node_modules
+web/dist
+events/*.jpg
+events/*.jsonl
+data/samples/*/
+data/labels/*/
+data/models/*.pt
+data/training/*/
+*.egg-info
+templates

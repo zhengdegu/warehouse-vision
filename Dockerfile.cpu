@@ -1,0 +1,32 @@
+# ── Stage 1: 构建前端 ──
+FROM node:22-alpine AS frontend
+WORKDIR /web
+COPY web/package.json web/package-lock.json* ./
+RUN npm ci
+COPY web/ .
+RUN npm run build
+
+# ── Stage 2: Python 后端 (CPU only) ──
+FROM python:3.12-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY src/ src/
+COPY scripts/ scripts/
+COPY configs/ configs/
+COPY --from=frontend /web/dist web/dist
+
+RUN mkdir -p events data/samples data/labels data/models data/training data/metadata
+
+EXPOSE 8000
+
+CMD ["python", "scripts/run_all.py"]

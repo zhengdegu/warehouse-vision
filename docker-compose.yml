@@ -1,0 +1,24 @@
+version: "3.8"
+
+services:
+  warehouse-vision:
+    build: .
+    container_name: warehouse-vision
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./configs:/app/configs
+      - ./data:/app/data
+      - ./events:/app/events
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    # GPU 支持（需要 nvidia-container-toolkit）
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

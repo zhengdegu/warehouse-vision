@@ -1,0 +1,1416 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>仓储安防视频分析系统</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #1a1a2e; color: #eee; min-height: 100vh; }
+        .header { background: #16213e; padding: 12px 24px; display: flex; align-items: center; justify-content: space-between; border-bottom: 2px solid #0f3460; }
+        .header h1 { font-size: 20px; color: #e94560; }
+        .header-right { display: flex; align-items: center; gap: 16px; }
+        .status { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+        .status-dot { width: 9px; height: 9px; border-radius: 50%; background: #4caf50; }
+        .status-dot.disconnected { background: #f44336; }
+        .tab-bar { background: #16213e; display: flex; gap: 0; border-bottom: 1px solid #0f3460; }
+        .tab-btn { padding: 10px 28px; cursor: pointer; font-size: 14px; color: #aaa; border: none; background: none; border-bottom: 2px solid transparent; transition: .2s; }
+        .tab-btn:hover { color: #eee; }
+        .tab-btn.active { color: #e94560; border-bottom-color: #e94560; }
+        .tab-page { display: none; }
+        .tab-page.active { display: block; }
+        .monitor-grid { display: grid; grid-template-columns: 1fr 340px; gap: 18px; padding: 18px; max-width: 1600px; margin: 0 auto; }
+        .video-section { display: flex; flex-direction: column; gap: 12px; }
+        .cam-bar { display: flex; gap: 10px; align-items: center; }
+        .cam-bar label { font-size: 13px; color: #aaa; }
+        .cam-bar select, .cam-bar button { background: #16213e; color: #eee; border: 1px solid #0f3460; padding: 7px 14px; border-radius: 5px; font-size: 13px; cursor: pointer; }
+        .video-box { background: #000; border-radius: 8px; overflow: hidden; position: relative; min-height: 360px; }
+        .video-box img { width: 100%; display: block; min-height: 360px; object-fit: contain; }
+        .stats-bar { display: grid; grid-template-columns: repeat(4,1fr); gap: 10px; }
+        .stat-card { background: #16213e; border-radius: 8px; padding: 14px; text-align: center; }
+        .stat-card .value { font-size: 26px; font-weight: bold; color: #e94560; }
+        .stat-card .label { font-size: 11px; color: #aaa; margin-top: 4px; }
+        .sidebar { display: flex; flex-direction: column; gap: 12px; }
+        .alert-panel { background: #16213e; border-radius: 8px; padding: 14px; flex: 1; overflow-y: auto; max-height: 70vh; }
+        .alert-panel h3 { font-size: 15px; margin-bottom: 8px; color: #e94560; }
+        .alert-item { background: #1a1a2e; border-left: 3px solid #e94560; padding: 9px; margin-bottom: 7px; border-radius: 0 5px 5px 0; font-size: 12px; animation: fadeIn .3s ease; }
+        .alert-item.flash { animation: flash 1s ease; }
+        .alert-item .time { color: #888; font-size: 11px; }
+        .alert-item .type { color: #e94560; font-weight: bold; text-transform: uppercase; }
+        .alert-item .detail { color: #ccc; margin-top: 3px; }
+        @keyframes fadeIn { from{opacity:0;transform:translateX(20px)} to{opacity:1;transform:translateX(0)} }
+        @keyframes flash { 0%,100%{background:#1a1a2e} 50%{background:rgba(233,69,96,.3)} }
+        .no-alerts { color: #666; text-align: center; padding: 24px; font-size: 13px; }
+        .config-page { padding: 18px; max-width: 1200px; margin: 0 auto; }
+        .config-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+        .config-header h2 { font-size: 18px; color: #e94560; }
+        .btn { padding: 8px 18px; border: none; border-radius: 5px; cursor: pointer; font-size: 13px; transition: .2s; }
+        .btn-primary { background: #e94560; color: #fff; }
+        .btn-primary:hover { background: #d63851; }
+        .btn-danger { background: #c0392b; color: #fff; }
+        .btn-danger:hover { background: #a93226; }
+        .btn-secondary { background: #0f3460; color: #eee; }
+        .btn-secondary:hover { background: #1a4a7a; }
+        .btn-sm { padding: 5px 12px; font-size: 12px; }
+        .cam-table { width: 100%; border-collapse: collapse; background: #16213e; border-radius: 8px; overflow: hidden; }
+        .cam-table th, .cam-table td { padding: 10px 14px; text-align: left; font-size: 13px; border-bottom: 1px solid #0f3460; }
+        .cam-table th { color: #aaa; font-weight: 600; }
+        .cam-table td .actions { display: flex; gap: 6px; }
+        .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 1000; justify-content: center; align-items: flex-start; padding-top: 20px; overflow-y: auto; }
+        .modal-overlay.open { display: flex; }
+        .modal { background: #16213e; border-radius: 10px; width: 900px; max-width: 95vw; padding: 24px; position: relative; max-height: 95vh; overflow-y: auto; }
+        .modal h3 { font-size: 17px; color: #e94560; margin-bottom: 16px; }
+        .modal-close { position: absolute; top: 12px; right: 16px; background: none; border: none; color: #aaa; font-size: 22px; cursor: pointer; }
+        .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+        .form-group { display: flex; flex-direction: column; gap: 4px; }
+        .form-group.full { grid-column: 1 / -1; }
+        .form-group label { font-size: 12px; color: #aaa; }
+        .form-group input, .form-group select, .form-group textarea { background: #1a1a2e; color: #eee; border: 1px solid #0f3460; padding: 8px 10px; border-radius: 5px; font-size: 13px; }
+        .form-group textarea { resize: vertical; min-height: 50px; font-family: monospace; }
+        .section-title { font-size: 14px; color: #e94560; margin: 16px 0 8px; padding-bottom: 4px; border-bottom: 1px solid #0f3460; grid-column: 1 / -1; }
+        .toggle-row { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+        .toggle-row input[type="checkbox"] { accent-color: #e94560; width: 16px; height: 16px; }
+        .modal-footer { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
+        .msg-toast { position: fixed; top: 20px; right: 20px; z-index: 2000; padding: 12px 20px; border-radius: 6px; font-size: 13px; color: #fff; display: none; animation: fadeIn .3s; }
+        .msg-toast.success { background: #27ae60; }
+        .msg-toast.error { background: #c0392b; }
+        /* Alert detail modal */
+        .alert-item { cursor: pointer; transition: background .2s; }
+        .alert-item:hover { background: rgba(233,69,96,.15); }
+        .alert-detail-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.7); z-index: 1100; justify-content: center; align-items: center; }
+        .alert-detail-overlay.open { display: flex; }
+        .alert-detail { background: #16213e; border-radius: 10px; width: 800px; max-width: 95vw; max-height: 90vh; overflow-y: auto; padding: 24px; position: relative; }
+        .alert-detail-close { position: absolute; top: 12px; right: 16px; background: none; border: none; color: #aaa; font-size: 22px; cursor: pointer; }
+        .alert-detail h3 { font-size: 17px; color: #e94560; margin-bottom: 12px; }
+        .alert-detail-img { width: 100%; border-radius: 6px; margin-bottom: 12px; background: #000; min-height: 200px; }
+        .alert-detail-img img { width: 100%; display: block; border-radius: 6px; }
+        .alert-detail-info { display: grid; grid-template-columns: 120px 1fr; gap: 6px 12px; font-size: 13px; }
+        .alert-detail-info .lbl { color: #888; }
+        .alert-detail-info .val { color: #eee; word-break: break-all; }
+        /* Canvas draw editor */
+        .draw-editor { position: relative; background: #000; border-radius: 6px; overflow: hidden; margin: 8px 0; }
+        .draw-editor canvas { display: block; cursor: crosshair; }
+        .draw-toolbar { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; flex-wrap: wrap; }
+        .draw-toolbar .btn { padding: 5px 12px; font-size: 12px; }
+        .draw-toolbar .draw-mode-label { font-size: 12px; color: #aaa; margin-left: 8px; }
+        .draw-toolbar .active-mode { background: #e94560; color: #fff; }
+        .tw-list { margin-top: 8px; }
+        .tw-item { background: #1a1a2e; border: 1px solid #0f3460; border-radius: 5px; padding: 8px 10px; margin-bottom: 6px; display: flex; align-items: center; justify-content: space-between; font-size: 12px; }
+        .tw-item .tw-info { display: flex; gap: 10px; align-items: center; flex: 1; }
+        .tw-item input { background: #16213e; color: #eee; border: 1px solid #0f3460; padding: 4px 8px; border-radius: 4px; font-size: 12px; width: 80px; }
+        .tw-item select { background: #16213e; color: #eee; border: 1px solid #0f3460; padding: 4px 6px; border-radius: 4px; font-size: 11px; }
+        .tw-color { width: 12px; height: 12px; border-radius: 50%; display: inline-block; }
+
+        /* ===== Training Tab ===== */
+        .training-layout { display: grid; grid-template-columns: 180px 1fr; gap: 0; min-height: calc(100vh - 100px); }
+        .training-sidebar { background: #16213e; border-right: 1px solid #0f3460; padding: 12px 0; }
+        .training-sidebar .nav-item { display: block; width: 100%; padding: 10px 18px; font-size: 13px; color: #aaa; background: none; border: none; text-align: left; cursor: pointer; transition: .2s; border-left: 3px solid transparent; }
+        .training-sidebar .nav-item:hover { color: #eee; background: rgba(233,69,96,.08); }
+        .training-sidebar .nav-item.active { color: #e94560; border-left-color: #e94560; background: rgba(233,69,96,.1); }
+        .training-main { padding: 18px 24px; overflow-y: auto; max-height: calc(100vh - 100px); }
+        .training-section { display: none; }
+        .training-section.active { display: block; }
+        .training-section h2 { font-size: 18px; color: #e94560; margin-bottom: 16px; }
+        .t-card { background: #16213e; border-radius: 8px; padding: 16px; margin-bottom: 14px; border: 1px solid #0f3460; }
+        .t-card h4 { font-size: 14px; color: #e94560; margin-bottom: 10px; }
+        .t-form-row { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; margin-bottom: 10px; }
+        .t-form-row .form-group { margin-bottom: 0; }
+        .t-table { width: 100%; border-collapse: collapse; background: #16213e; border-radius: 8px; overflow: hidden; }
+        .t-table th, .t-table td { padding: 9px 12px; text-align: left; font-size: 13px; border-bottom: 1px solid #0f3460; }
+        .t-table th { color: #aaa; font-weight: 600; }
+        .t-table td .actions { display: flex; gap: 6px; }
+        .badge { display: inline-block; padding: 3px 10px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+        .badge-pending { background: #f39c12; color: #000; }
+        .badge-running { background: #3498db; color: #fff; }
+        .badge-completed { background: #27ae60; color: #fff; }
+        .badge-failed { background: #c0392b; color: #fff; }
+        .badge-cancelled { background: #7f8c8d; color: #fff; }
+        .progress-bar-wrap { background: #0f3460; border-radius: 6px; height: 18px; overflow: hidden; position: relative; }
+        .progress-bar-fill { height: 100%; background: linear-gradient(90deg, #e94560, #3498db); border-radius: 6px; transition: width .4s; }
+        .progress-bar-text { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 11px; color: #fff; font-weight: 600; }
+        .metric { font-size: 13px; color: #4caf50; font-weight: 600; }
+        .t-empty { color: #666; text-align: center; padding: 24px; font-size: 13px; }
+        .t-upload-zone { border: 2px dashed #0f3460; border-radius: 8px; padding: 24px; text-align: center; color: #888; font-size: 13px; cursor: pointer; transition: .2s; }
+        .t-upload-zone:hover { border-color: #e94560; color: #ccc; }
+        .t-stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-bottom: 14px; }
+        .t-stat { background: #1a1a2e; border-radius: 6px; padding: 12px; text-align: center; }
+        .t-stat .val { font-size: 22px; font-weight: bold; color: #e94560; }
+        .t-stat .lbl { font-size: 11px; color: #aaa; margin-top: 2px; }
+        .sample-thumb { width: 60px; height: 60px; object-fit: cover; border-radius: 4px; background: #000; }
+    </style>
+</head>
+<body>
+
+<div class="header">
+    <h1>仓储安防视频分析系统</h1>
+    <div class="header-right">
+        <div class="status"><div class="status-dot" id="wsDot"></div><span id="wsStatus">连接中...</span></div>
+    </div>
+</div>
+<div class="tab-bar">
+    <button class="tab-btn active" onclick="switchTab('monitor')">实时监控</button>
+    <button class="tab-btn" onclick="switchTab('config')">摄像头配置</button>
+    <button class="tab-btn" onclick="switchTab('training')">模型训练</button>
+</div>
+
+<!-- 监控页 -->
+<div id="page-monitor" class="tab-page active">
+    <div class="monitor-grid">
+        <div class="video-section">
+            <div class="cam-bar">
+                <label>摄像头：</label>
+                <select id="cameraSelect" onchange="switchCamera()"><option value="">加载中...</option></select>
+            </div>
+            <div class="video-box"><img id="videoStream" src="" alt="视频流"></div>
+            <div class="stats-bar">
+                <div class="stat-card"><div class="value" id="statIn">0</div><div class="label">进入</div></div>
+                <div class="stat-card"><div class="value" id="statOut">0</div><div class="label">离开</div></div>
+                <div class="stat-card"><div class="value" id="statTotal">0</div><div class="label">当前窗口</div></div>
+                <div class="stat-card"><div class="value" id="statAlerts">0</div><div class="label">告警数</div></div>
+            </div>
+        </div>
+        <div class="sidebar">
+            <div class="alert-panel">
+                <h3>实时告警 <button class="btn btn-secondary btn-sm" style="float:right;margin-top:-4px" onclick="loadHistoryAlerts()">历史记录</button></h3>
+                <div id="alertList"><div class="no-alerts">暂无告警</div></div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- 配置页 -->
+<div id="page-config" class="tab-page">
+    <div class="config-page">
+        <div class="config-header">
+            <h2>摄像头管理</h2>
+            <button class="btn btn-primary" onclick="openAddModal()">+ 添加摄像头</button>
+        </div>
+        <table class="cam-table">
+            <thead><tr><th>ID</th><th>名称</th><th>RTSP 地址</th><th>分辨率</th><th>FPS</th><th>操作</th></tr></thead>
+            <tbody id="camTableBody"><tr><td colspan="6" style="text-align:center;color:#666">加载中...</td></tr></tbody>
+        </table>
+    </div>
+</div>
+
+<!-- 模型训练页 -->
+<div id="page-training" class="tab-page">
+    <div class="training-layout">
+        <div class="training-sidebar">
+            <button class="nav-item active" onclick="switchTrainingSub('datasets')">数据集管理</button>
+            <button class="nav-item" onclick="switchTrainingSub('samples')">样本管理</button>
+            <button class="nav-item" onclick="switchTrainingSub('annotations')">标注管理</button>
+            <button class="nav-item" onclick="switchTrainingSub('jobs')">训练任务</button>
+            <button class="nav-item" onclick="switchTrainingSub('models')">模型管理</button>
+        </div>
+        <div class="training-main">
+
+            <!-- 数据集管理 -->
+            <div id="tsec-datasets" class="training-section active">
+                <h2>数据集管理</h2>
+                <div class="t-card">
+                    <h4>创建数据集</h4>
+                    <div class="t-form-row">
+                        <div class="form-group"><label>数据集名称</label><input id="t_ds_name" placeholder="如 warehouse_v1"></div>
+                        <div class="form-group"><label>类别（逗号分隔）</label><input id="t_ds_classes" placeholder="如 person,forklift,box" style="width:260px"></div>
+                        <button class="btn btn-primary" onclick="createDataset()">创建</button>
+                    </div>
+                </div>
+                <div class="t-card">
+                    <h4>数据集列表</h4>
+                    <table class="t-table">
+                        <thead><tr><th>名称</th><th>类别</th><th>样本数</th><th>已标注</th><th>操作</th></tr></thead>
+                        <tbody id="t_ds_tbody"><tr><td colspan="5" class="t-empty">加载中...</td></tr></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- 样本管理 -->
+            <div id="tsec-samples" class="training-section">
+                <h2>样本管理</h2>
+                <div class="t-card">
+                    <h4>上传样本</h4>
+                    <div class="t-form-row">
+                        <div class="form-group"><label>目标数据集</label><select id="t_sample_ds"></select></div>
+                        <div class="form-group"><label>选择图片</label><input type="file" id="t_sample_files" multiple accept="image/*" style="background:none;border:none;color:#eee"></div>
+                        <button class="btn btn-primary" onclick="uploadSamples()">上传</button>
+                    </div>
+                </div>
+                <div class="t-card">
+                    <h4>样本列表 <span style="font-size:12px;color:#888;margin-left:8px">数据集：</span><select id="t_sample_filter_ds" onchange="loadSamples()" style="background:#1a1a2e;color:#eee;border:1px solid #0f3460;padding:4px 8px;border-radius:4px;font-size:12px"></select></h4>
+                    <table class="t-table">
+                        <thead><tr><th>缩略图</th><th>文件名</th><th>数据集</th><th>已标注</th><th>操作</th></tr></thead>
+                        <tbody id="t_sample_tbody"><tr><td colspan="5" class="t-empty">请选择数据集</td></tr></tbody>
+                    </table>
+                    <div style="display:flex;justify-content:center;gap:10px;margin-top:10px">
+                        <button class="btn btn-secondary btn-sm" onclick="loadSamples(samplePage-1)">上一页</button>
+                        <span id="t_sample_page_info" style="font-size:12px;color:#888;line-height:28px">第1页</span>
+                        <button class="btn btn-secondary btn-sm" onclick="loadSamples(samplePage+1)">下一页</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 标注管理 -->
+            <div id="tsec-annotations" class="training-section">
+                <h2>标注管理</h2>
+                <div class="t-card">
+                    <h4>自动标注</h4>
+                    <div class="t-form-row">
+                        <div class="form-group"><label>目标数据集</label><select id="t_anno_ds"></select></div>
+                        <div class="form-group"><label>模型路径</label><input id="t_anno_model" placeholder="如 yolov8n.pt" value="yolov8n.pt"></div>
+                        <div class="form-group"><label>置信度阈值</label><input id="t_anno_conf" type="number" step="0.05" value="0.25" style="width:80px"></div>
+                        <button class="btn btn-primary" onclick="autoAnnotate()">开始自动标注</button>
+                    </div>
+                </div>
+                <div class="t-card">
+                    <h4>样本标注查看 <span style="font-size:12px;color:#888;margin-left:8px">数据集：</span><select id="t_anno_filter_ds" onchange="loadAnnotationSamples()" style="background:#1a1a2e;color:#eee;border:1px solid #0f3460;padding:4px 8px;border-radius:4px;font-size:12px"></select></h4>
+                    <table class="t-table">
+                        <thead><tr><th>缩略图</th><th>文件名</th><th>标注数</th><th>操作</th></tr></thead>
+                        <tbody id="t_anno_tbody"><tr><td colspan="4" class="t-empty">请选择数据集</td></tr></tbody>
+                    </table>
+                    <div style="display:flex;justify-content:center;gap:10px;margin-top:10px">
+                        <button class="btn btn-secondary btn-sm" onclick="loadAnnotationSamples(annoPage-1)">上一页</button>
+                        <span id="t_anno_page_info" style="font-size:12px;color:#888;line-height:28px">第1页</span>
+                        <button class="btn btn-secondary btn-sm" onclick="loadAnnotationSamples(annoPage+1)">下一页</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 训练任务 -->
+            <div id="tsec-jobs" class="training-section">
+                <h2>训练任务</h2>
+                <div class="t-card">
+                    <h4>创建训练任务</h4>
+                    <div class="t-form-row">
+                        <div class="form-group"><label>数据集</label><select id="t_job_ds"></select></div>
+                        <div class="form-group"><label>Epochs</label><input id="t_job_epochs" type="number" value="50" style="width:80px"></div>
+                        <div class="form-group"><label>Batch Size</label><input id="t_job_batch" type="number" value="16" style="width:80px"></div>
+                        <div class="form-group"><label>Image Size</label><input id="t_job_imgsize" type="number" value="640" style="width:80px"></div>
+                        <div class="form-group"><label>Base Model</label><input id="t_job_base" value="yolov8n.pt" style="width:140px"></div>
+                        <button class="btn btn-primary" onclick="createJob()">开始训练</button>
+                    </div>
+                </div>
+                <div class="t-card">
+                    <h4>迭代训练</h4>
+                    <div class="t-form-row">
+                        <div class="form-group"><label>数据集</label><select id="t_iter_ds"></select></div>
+                        <div class="form-group"><label>父模型</label><select id="t_iter_parent"></select></div>
+                        <div class="form-group"><label>Epochs</label><input id="t_iter_epochs" type="number" value="30" style="width:80px"></div>
+                        <div class="form-group"><label>Batch Size</label><input id="t_iter_batch" type="number" value="16" style="width:80px"></div>
+                        <div class="form-group"><label>Image Size</label><input id="t_iter_imgsize" type="number" value="640" style="width:80px"></div>
+                        <button class="btn btn-primary" onclick="createIterateJob()">迭代训练</button>
+                    </div>
+                </div>
+                <div class="t-card">
+                    <h4>任务列表</h4>
+                    <table class="t-table">
+                        <thead><tr><th>任务ID</th><th>数据集</th><th>状态</th><th>进度</th><th>Epochs</th><th>创建时间</th><th>操作</th></tr></thead>
+                        <tbody id="t_job_tbody"><tr><td colspan="7" class="t-empty">加载中...</td></tr></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- 模型管理 -->
+            <div id="tsec-models" class="training-section">
+                <h2>模型管理</h2>
+                <div class="t-card">
+                    <table class="t-table">
+                        <thead><tr><th>模型ID</th><th>数据集</th><th>mAP50</th><th>mAP50-95</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead>
+                        <tbody id="t_model_tbody"><tr><td colspan="7" class="t-empty">加载中...</td></tr></tbody>
+                    </table>
+                </div>
+            </div>
+
+        </div>
+    </div>
+</div>
+
+<!-- 添加/编辑 Modal -->
+<div class="modal-overlay" id="camModal">
+    <div class="modal">
+        <button class="modal-close" onclick="closeModal()">&times;</button>
+        <h3 id="modalTitle">添加摄像头</h3>
+        <form id="camForm" onsubmit="return submitCamForm(event)">
+            <input type="hidden" id="f_mode" value="add">
+            <input type="hidden" id="f_orig_id" value="">
+            <div class="form-grid">
+                <div class="form-group"><label>摄像头 ID *</label><input id="f_id" required placeholder="如 cam01"></div>
+                <div class="form-group"><label>名称</label><input id="f_name" placeholder="如 仓库入口"></div>
+                <div class="form-group full"><label>RTSP 地址 *</label><input id="f_url" required placeholder="rtsp://..."></div>
+                <div class="form-group"><label>宽度</label><input id="f_width" type="number" value="1280"></div>
+                <div class="form-group"><label>高度</label><input id="f_height" type="number" value="720"></div>
+                <div class="form-group"><label>FPS</label><input id="f_fps" type="number" value="15"></div>
+
+                <!-- 可视化 ROI + Tripwire 编辑器 -->
+                <div class="section-title">区域 &amp; 入口线配置（在画面上绘制）</div>
+                <div class="form-group full">
+                    <div class="draw-toolbar">
+                        <button type="button" class="btn btn-secondary btn-sm active-mode" id="btnDrawROI" onclick="setDrawMode('roi')">绘制禁区(ROI)</button>
+                        <button type="button" class="btn btn-secondary btn-sm" id="btnDrawTW" onclick="setDrawMode('tripwire')">绘制入口线</button>
+                        <button type="button" class="btn btn-danger btn-sm" onclick="clearDrawing()">清除全部</button>
+                        <button type="button" class="btn btn-secondary btn-sm" onclick="undoLastPoint()">撤销上一点</button>
+                        <button type="button" class="btn btn-primary btn-sm" onclick="finishROI()" id="btnFinishROI">完成禁区</button>
+                        <span class="draw-mode-label" id="drawModeLabel">当前: 绘制禁区</span>
+                    </div>
+                    <div class="draw-editor" id="drawEditor">
+                        <canvas id="drawCanvas" width="640" height="360"></canvas>
+                    </div>
+                    <div class="draw-toolbar" style="margin-top:4px">
+                        <button type="button" class="btn btn-secondary btn-sm" onclick="loadSnapshotToCanvas()">刷新画面</button>
+                        <span style="font-size:11px;color:#888">提示: 点击画面绘制点，禁区需3个以上点后点"完成禁区"，入口线点2个点自动生成</span>
+                    </div>
+                </div>
+
+                <!-- 入口线列表 -->
+                <div class="form-group full">
+                    <label>已配置的入口线</label>
+                    <div class="tw-list" id="twList"><span style="color:#666;font-size:12px">暂无入口线，请在画面上绘制</span></div>
+                </div>
+
+                <!-- 隐藏的数据字段 -->
+                <input type="hidden" id="f_roi" value="">
+                <input type="hidden" id="f_tripwires" value="[]">
+
+                <!-- 规则 -->
+                <div class="section-title">检测规则</div>
+                <div class="form-group"><div class="toggle-row"><input type="checkbox" id="f_r_intrusion"> 入侵检测</div></div>
+                <div class="form-group"><label>确认帧数 / 冷却(s)</label><div style="display:flex;gap:6px"><input id="f_r_intrusion_cf" type="number" value="5" style="width:50%"><input id="f_r_intrusion_cd" type="number" value="30" style="width:50%"></div></div>
+                <div class="form-group"><div class="toggle-row"><input type="checkbox" id="f_r_tripwire"> 越线检测</div></div>
+                <div class="form-group"></div>
+                <div class="form-group"><div class="toggle-row"><input type="checkbox" id="f_r_counting"> 流量计数</div></div>
+                <div class="form-group"><label>窗口(s)</label><input id="f_r_counting_ws" type="number" value="60"></div>
+                <div class="form-group"><div class="toggle-row"><input type="checkbox" id="f_r_dwell"> 滞留检测</div></div>
+                <div class="form-group"><label>最大秒数/确认帧/冷却</label><div style="display:flex;gap:6px"><input id="f_r_dwell_ms" type="number" value="120" style="width:33%"><input id="f_r_dwell_cf" type="number" value="5" style="width:33%"><input id="f_r_dwell_cd" type="number" value="60" style="width:33%"></div></div>
+                <div class="form-group"><div class="toggle-row"><input type="checkbox" id="f_r_crowd"> 聚集检测</div></div>
+                <div class="form-group"><label>最大人数/半径/确认帧/冷却</label><div style="display:flex;gap:4px"><input id="f_r_crowd_mc" type="number" value="5" style="width:25%"><input id="f_r_crowd_r" type="number" value="200" style="width:25%"><input id="f_r_crowd_cf" type="number" value="5" style="width:25%"><input id="f_r_crowd_cd" type="number" value="60" style="width:25%"></div></div>
+                <div class="form-group"><div class="toggle-row"><input type="checkbox" id="f_r_prox"> 人车过近</div></div>
+                <div class="form-group"><label>最小距离/确认帧/冷却</label><div style="display:flex;gap:6px"><input id="f_r_prox_md" type="number" value="50" style="width:33%"><input id="f_r_prox_cf" type="number" value="3" style="width:33%"><input id="f_r_prox_cd" type="number" value="30" style="width:33%"></div></div>
+                <div class="form-group"><div class="toggle-row"><input type="checkbox" id="f_r_fight"> 打架检测</div></div>
+                <div class="form-group"><label>近距半径/最小速度/最少人数/确认帧/冷却</label><div style="display:flex;gap:4px"><input id="f_r_fight_pr" type="number" value="150" style="width:20%"><input id="f_r_fight_ms" type="number" value="60" style="width:20%"><input id="f_r_fight_mp" type="number" value="2" style="width:20%"><input id="f_r_fight_cf" type="number" value="3" style="width:20%"><input id="f_r_fight_cd" type="number" value="30" style="width:20%"></div></div>
+                <div class="form-group"><div class="toggle-row"><input type="checkbox" id="f_r_fall"> 跌倒检测</div></div>
+                <div class="form-group"><label>宽高比阈值/比值变化/Y下移/确认帧/冷却</label><div style="display:flex;gap:4px"><input id="f_r_fall_rt" type="number" step="0.1" value="1.0" style="width:20%"><input id="f_r_fall_rc" type="number" step="0.1" value="0.5" style="width:20%"><input id="f_r_fall_yd" type="number" value="20" style="width:20%"><input id="f_r_fall_cf" type="number" value="2" style="width:20%"><input id="f_r_fall_cd" type="number" value="30" style="width:20%"></div></div>
+
+                <div class="section-title">告警过滤（勾选的类型才触发告警推送，不勾选只记录日志）</div>
+                <div class="form-group full" style="display:flex;flex-wrap:wrap;gap:14px">
+                    <div class="toggle-row"><input type="checkbox" id="f_alert_intrusion"> 入侵</div>
+                    <div class="toggle-row"><input type="checkbox" id="f_alert_tripwire" checked> 越线</div>
+                    <div class="toggle-row"><input type="checkbox" id="f_alert_presence"> 目标检测</div>
+                    <div class="toggle-row"><input type="checkbox" id="f_alert_dwell"> 滞留</div>
+                    <div class="toggle-row"><input type="checkbox" id="f_alert_crowd"> 聚集</div>
+                    <div class="toggle-row"><input type="checkbox" id="f_alert_proximity"> 人车过近</div>
+                    <div class="toggle-row"><input type="checkbox" id="f_alert_fight"> 打架</div>
+                    <div class="toggle-row"><input type="checkbox" id="f_alert_fall"> 跌倒</div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" onclick="closeModal()">取消</button>
+                <button type="submit" class="btn btn-primary">保存</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<div class="msg-toast" id="msgToast"></div>
+
+<!-- 告警详情弹窗 -->
+<div class="alert-detail-overlay" id="alertDetailOverlay" onclick="if(event.target===this)closeAlertDetail()">
+    <div class="alert-detail">
+        <button class="alert-detail-close" onclick="closeAlertDetail()">&times;</button>
+        <h3 id="alertDetailTitle">告警详情</h3>
+        <div class="alert-detail-img" id="alertDetailImgBox">
+            <img id="alertDetailImg" src="" alt="告警截图" style="display:none">
+            <div id="alertDetailNoImg" style="color:#666;text-align:center;padding:40px;font-size:13px">无截图</div>
+        </div>
+        <div class="alert-detail-info" id="alertDetailInfo"></div>
+    </div>
+</div>
+
+<script>
+/* ===== State ===== */
+let ws = null, alertCount = 0, currentCamera = "", allCameras = [];
+const MAX_ALERTS = 100;
+
+/* ===== Tabs ===== */
+function switchTab(name) {
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.tab-page').forEach(p => p.classList.remove('active'));
+    document.querySelector('.tab-btn[onclick="switchTab(\'' + name + '\')"]').classList.add('active');
+    document.getElementById('page-' + name).classList.add('active');
+    if (name === 'config') loadCamTable();
+}
+
+/* ===== Toast ===== */
+function toast(msg, type) {
+    const el = document.getElementById('msgToast');
+    el.textContent = msg; el.className = 'msg-toast ' + type; el.style.display = 'block';
+    setTimeout(() => { el.style.display = 'none'; }, 3000);
+}
+
+/* ===== Monitor ===== */
+async function loadCameras() {
+    try {
+        const resp = await fetch('/api/cameras');
+        allCameras = await resp.json();
+        const sel = document.getElementById('cameraSelect');
+        sel.innerHTML = '';
+        if (allCameras.length === 0) { sel.innerHTML = '<option value="">无摄像头</option>'; return; }
+        allCameras.forEach((c, i) => {
+            const o = document.createElement('option');
+            o.value = c.id; o.textContent = c.name || c.id;
+            sel.appendChild(o);
+            if (i === 0) currentCamera = c.id;
+        });
+        if (currentCamera) { startMjpegStream(); updateCounts(); }
+    } catch (e) { console.error(e); }
+}
+
+function switchCamera() {
+    currentCamera = document.getElementById('cameraSelect').value;
+    startMjpegStream();
+    // 先归零，等 updateCounts 从后端拉取真实值
+    document.getElementById('statIn').textContent = '0';
+    document.getElementById('statOut').textContent = '0';
+    document.getElementById('statTotal').textContent = '0';
+    document.getElementById('statAlerts').textContent = '0';
+    alertCount = 0;
+    updateCounts();
+    // 切换摄像头时重置告警列表
+    document.getElementById('alertList').innerHTML = '<div class="no-alerts">暂无告警</div>';
+    _alertEvents = [];
+}
+
+let _snapshotTimer = null;
+function refreshSnapshot() {
+    if (_snapshotTimer) clearInterval(_snapshotTimer);
+    const img = document.getElementById('videoStream');
+    function loadFrame() { if (currentCamera) img.src = '/snapshot/' + currentCamera + '?t=' + Date.now(); }
+    loadFrame();
+    _snapshotTimer = setInterval(loadFrame, 200);
+}
+
+function startMjpegStream() {
+    // 停掉 snapshot 轮询（如果有的话）
+    if (_snapshotTimer) { clearInterval(_snapshotTimer); _snapshotTimer = null; }
+    const img = document.getElementById('videoStream');
+    if (!currentCamera) { img.src = ''; return; }
+    // 先清空 src 断开旧的 MJPEG 连接，再设置新的
+    img.src = '';
+    // 用 setTimeout 确保浏览器断开旧连接后再建立新连接
+    setTimeout(function() {
+        img.src = '/stream/' + currentCamera + '?t=' + Date.now();
+    }, 50);
+}
+
+async function updateCounts() {
+    try {
+        const r = await fetch('/api/counts'); const d = await r.json(); const c = d[currentCamera];
+        if (c) {
+            document.getElementById('statIn').textContent = c.total_in || 0;
+            document.getElementById('statOut').textContent = c.total_out || 0;
+            document.getElementById('statTotal').textContent = (c.window_in||0)+(c.window_out||0);
+            if (c.alert_count !== undefined) {
+                alertCount = c.alert_count;
+                document.getElementById('statAlerts').textContent = c.alert_count;
+            }
+        }
+    } catch(e){}
+}
+
+let _alertEvents = []; // store event data for detail view
+
+function addAlert(event) {
+    // 只有当前摄像头的告警才显示和计数
+    if (event.camera_id && event.camera_id !== currentCamera) return;
+    alertCount++;
+    _alertEvents.unshift(event);
+    if (_alertEvents.length > MAX_ALERTS) _alertEvents.pop();
+    document.getElementById('statAlerts').textContent = alertCount;
+    const list = document.getElementById('alertList');
+    const na = list.querySelector('.no-alerts'); if (na) na.remove();
+    const item = document.createElement('div');
+    item.className = 'alert-item flash';
+    const idx = _alertEvents.length - 1;
+    item.onclick = function() { showAlertDetail(_alertEvents[0]); };
+    // use closure to capture the right event
+    (function(evt) { item.onclick = function() { showAlertDetail(evt); }; })(event);
+    const ts = new Date(event.timestamp * 1000).toLocaleTimeString('zh-CN');
+    let tp = event.type; if (event.sub_type) tp += '/' + event.sub_type;
+    let dt = '摄像头: ' + (event.camera_id || '') + ' | ' + (event.detail || '');
+    item.innerHTML = '<div class="time">' + ts + '</div><div class="type">' + tp + '</div><div class="detail">' + dt + '</div>';
+    list.insertBefore(item, list.firstChild);
+    while (list.children.length > MAX_ALERTS) list.removeChild(list.lastChild);
+}
+
+function showAlertDetail(evt) {
+    const TYPE_NAMES = {intrusion:'区域入侵',tripwire:'越线检测',presence:'目标检测',counting:'流量计数',anomaly:'异常检测'};
+    const SUB_TYPE_NAMES = {dwell:'滞留',crowd:'聚集',proximity:'人车过近',fight:'打架',fall:'跌倒',speed:'超速'};
+    const subLabel = evt.sub_type ? ' - ' + (SUB_TYPE_NAMES[evt.sub_type] || evt.sub_type) : '';
+    const title = (TYPE_NAMES[evt.type] || evt.type) + subLabel;
+    document.getElementById('alertDetailTitle').textContent = title;
+    // screenshot
+    const img = document.getElementById('alertDetailImg');
+    const noImg = document.getElementById('alertDetailNoImg');
+    if (evt.screenshot) {
+        img.src = '/events/' + encodeURIComponent(evt.screenshot);
+        img.style.display = 'block'; noImg.style.display = 'none';
+        img.onerror = function() { this.style.display = 'none'; noImg.style.display = ''; };
+    } else {
+        img.src = ''; img.style.display = 'none'; noImg.style.display = '';
+    }
+    // info grid
+    const ts = new Date(evt.timestamp * 1000).toLocaleString('zh-CN');
+    let rows = '';
+    rows += '<div class="lbl">时间</div><div class="val">' + ts + '</div>';
+    rows += '<div class="lbl">类型</div><div class="val">' + title + '</div>';
+    rows += '<div class="lbl">摄像头</div><div class="val">' + (evt.camera_id || '-') + '</div>';
+    if (evt.track_id !== undefined) rows += '<div class="lbl">跟踪ID</div><div class="val">#' + evt.track_id + '</div>';
+    if (evt.class_name) rows += '<div class="lbl">目标类别</div><div class="val">' + evt.class_name + '</div>';
+    if (evt.confidence) rows += '<div class="lbl">置信度</div><div class="val">' + (evt.confidence * 100).toFixed(1) + '%</div>';
+    if (evt.bbox) rows += '<div class="lbl">位置(bbox)</div><div class="val">[' + evt.bbox.map(v=>Math.round(v)).join(', ') + ']</div>';
+    if (evt.detail) rows += '<div class="lbl">详情</div><div class="val">' + evt.detail + '</div>';
+    document.getElementById('alertDetailInfo').innerHTML = rows;
+    document.getElementById('alertDetailOverlay').classList.add('open');
+}
+
+function closeAlertDetail() {
+    document.getElementById('alertDetailOverlay').classList.remove('open');
+}
+
+async function loadHistoryAlerts() {
+    if (!currentCamera) return;
+    try {
+        const resp = await fetch('/api/events?limit=50&camera_id=' + currentCamera);
+        const data = await resp.json();
+        const events = data.items || data || [];
+        if (events.length === 0) { toast('该摄像头暂无历史告警', 'error'); return; }
+        const list = document.getElementById('alertList');
+        list.innerHTML = '';
+        _alertEvents = [];
+        alertCount = 0;
+        events.reverse().forEach(evt => addAlert(evt));
+        toast('已加载 ' + events.length + ' 条历史告警', 'success');
+    } catch(e) { toast('加载失败: ' + e, 'error'); }
+}
+
+/* ===== WebSocket ===== */
+function connectWS() {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    ws = new WebSocket(proto + '://' + location.host + '/ws/events');
+    ws.onopen = () => { document.getElementById('wsDot').classList.remove('disconnected'); document.getElementById('wsStatus').textContent = '已连接'; };
+    ws.onclose = () => { document.getElementById('wsDot').classList.add('disconnected'); document.getElementById('wsStatus').textContent = '已断开'; setTimeout(connectWS, 3000); };
+    ws.onerror = () => { ws.close(); };
+    ws.onmessage = (e) => { try { addAlert(JSON.parse(e.data)); } catch(err) { console.error(err); } };
+}
+
+/* ===== Config Table ===== */
+async function loadCamTable() {
+    try {
+        const resp = await fetch('/api/cameras'); const cams = await resp.json();
+        const tbody = document.getElementById('camTableBody');
+        if (cams.length === 0) { tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#666">暂无摄像头</td></tr>'; return; }
+        let html = '';
+        for (const cam of cams) {
+            let d = null; try { const r = await fetch('/api/cameras/' + cam.id); d = await r.json(); } catch(e){}
+            const url = d ? (d.url || '').substring(0, 40) + '...' : '-';
+            html += '<tr><td>' + cam.id + '</td><td>' + (cam.name||cam.id) + '</td><td title="' + (d?d.url:'') + '">' + url + '</td><td>' + (d?d.width:'-') + 'x' + (d?d.height:'-') + '</td><td>' + (d?d.fps:'-') + '</td>';
+            html += '<td><div class="actions"><button class="btn btn-secondary btn-sm" onclick="openEditModal(\'' + cam.id + '\')">编辑</button>';
+            html += '<button class="btn btn-danger btn-sm" onclick="deleteCam(\'' + cam.id + '\')">删除</button></div></td></tr>';
+        }
+        tbody.innerHTML = html;
+    } catch(e) { console.error(e); }
+}
+</script>
+
+<script>
+/* ===== Canvas Drawing Editor ===== */
+const canvas = document.getElementById('drawCanvas');
+const ctx = canvas.getContext('2d');
+let drawMode = 'roi'; // 'roi' or 'tripwire'
+let bgImage = null;
+let roiPoints = [];       // [[x,y], ...] in real coords
+let roiClosed = false;
+let twTemp = [];           // temp points for current tripwire being drawn
+let tripwires = [];        // [{id, name, p1, p2, direction}, ...]
+let twCounter = 0;
+const TW_COLORS = ['#ff00ff','#00ffff','#ffff00','#ff8800','#88ff00','#ff0088'];
+let canvasScale = 1;       // ratio: real image size / canvas display size
+let realW = 1280, realH = 720;
+
+function setDrawMode(mode) {
+    drawMode = mode;
+    document.getElementById('btnDrawROI').className = 'btn btn-secondary btn-sm' + (mode === 'roi' ? ' active-mode' : '');
+    document.getElementById('btnDrawTW').className = 'btn btn-secondary btn-sm' + (mode === 'tripwire' ? ' active-mode' : '');
+    document.getElementById('btnFinishROI').style.display = mode === 'roi' ? '' : 'none';
+    document.getElementById('drawModeLabel').textContent = '当前: ' + (mode === 'roi' ? '绘制禁区' : '绘制入口线');
+    twTemp = [];
+    redrawCanvas();
+}
+
+function loadSnapshotToCanvas() {
+    const camId = document.getElementById('f_id').value || currentCamera || 'cam01';
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = function() {
+        realW = parseInt(document.getElementById('f_width').value) || img.naturalWidth;
+        realH = parseInt(document.getElementById('f_height').value) || img.naturalHeight;
+        // fit canvas to modal width
+        const maxW = 850;
+        const ratio = Math.min(maxW / realW, 1);
+        canvas.width = Math.round(realW * ratio);
+        canvas.height = Math.round(realH * ratio);
+        canvasScale = realW / canvas.width;
+        bgImage = img;
+        redrawCanvas();
+    };
+    img.onerror = function() {
+        // no snapshot, draw gray bg
+        realW = parseInt(document.getElementById('f_width').value) || 1280;
+        realH = parseInt(document.getElementById('f_height').value) || 720;
+        const maxW = 850;
+        const ratio = Math.min(maxW / realW, 1);
+        canvas.width = Math.round(realW * ratio);
+        canvas.height = Math.round(realH * ratio);
+        canvasScale = realW / canvas.width;
+        bgImage = null;
+        redrawCanvas();
+    };
+    img.src = '/snapshot/' + camId + '?t=' + Date.now();
+}
+
+function redrawCanvas() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (bgImage) {
+        ctx.drawImage(bgImage, 0, 0, canvas.width, canvas.height);
+    } else {
+        ctx.fillStyle = '#222';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#666'; ctx.font = '16px sans-serif';
+        ctx.fillText('无画面 - 请先填写摄像头ID后点击"刷新画面"', 20, canvas.height/2);
+    }
+    // darken overlay
+    ctx.fillStyle = 'rgba(0,0,0,0.3)';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // Draw ROI
+    if (roiPoints.length > 0) {
+        ctx.beginPath();
+        const s = 1 / canvasScale;
+        ctx.moveTo(roiPoints[0][0]*s, roiPoints[0][1]*s);
+        for (let i = 1; i < roiPoints.length; i++) ctx.lineTo(roiPoints[i][0]*s, roiPoints[i][1]*s);
+        if (roiClosed) ctx.closePath();
+        ctx.strokeStyle = '#00ffff'; ctx.lineWidth = 2; ctx.stroke();
+        if (roiClosed) { ctx.fillStyle = 'rgba(0,255,255,0.15)'; ctx.fill(); }
+        // draw points
+        roiPoints.forEach((p, i) => {
+            ctx.beginPath(); ctx.arc(p[0]*s, p[1]*s, 5, 0, Math.PI*2);
+            ctx.fillStyle = i === 0 ? '#ff0' : '#0ff'; ctx.fill();
+        });
+        // label
+        ctx.fillStyle = '#0ff'; ctx.font = '13px sans-serif';
+        ctx.fillText('禁区(ROI)', roiPoints[0][0]*s, roiPoints[0][1]*s - 10);
+    }
+
+    // Draw existing tripwires
+    const s = 1 / canvasScale;
+    tripwires.forEach((tw, i) => {
+        const color = TW_COLORS[i % TW_COLORS.length];
+        ctx.beginPath();
+        ctx.moveTo(tw.p1[0]*s, tw.p1[1]*s);
+        ctx.lineTo(tw.p2[0]*s, tw.p2[1]*s);
+        ctx.strokeStyle = color; ctx.lineWidth = 3; ctx.stroke();
+        // endpoints
+        [tw.p1, tw.p2].forEach(p => { ctx.beginPath(); ctx.arc(p[0]*s, p[1]*s, 5, 0, Math.PI*2); ctx.fillStyle = color; ctx.fill(); });
+        // label
+        const mx = (tw.p1[0]+tw.p2[0])/2*s, my = (tw.p1[1]+tw.p2[1])/2*s;
+        ctx.fillStyle = color; ctx.font = '12px sans-serif';
+        ctx.fillText(tw.name || tw.id, mx+5, my-5);
+        // direction arrow
+        drawArrow(tw, s, color);
+    });
+
+    // Draw temp points
+    if (twTemp.length === 1) {
+        ctx.beginPath(); ctx.arc(twTemp[0][0]*s, twTemp[0][1]*s, 6, 0, Math.PI*2);
+        ctx.fillStyle = '#ff00ff'; ctx.fill();
+        ctx.fillStyle = '#ff00ff'; ctx.font = '11px sans-serif';
+        ctx.fillText('点击第二个点完成入口线', twTemp[0][0]*s+10, twTemp[0][1]*s-5);
+    }
+}
+
+function drawArrow(tw, s, color) {
+    const dx = tw.p2[0] - tw.p1[0], dy = tw.p2[1] - tw.p1[1];
+    const mx = (tw.p1[0]+tw.p2[0])/2*s, my = (tw.p1[1]+tw.p2[1])/2*s;
+    // perpendicular direction based on direction setting
+    let nx, ny;
+    if (tw.direction === 'left_to_right') { nx = -dy; ny = dx; }
+    else { nx = dy; ny = -dx; }
+    const len = Math.sqrt(nx*nx+ny*ny) || 1;
+    nx = nx/len*20; ny = ny/len*20;
+    ctx.beginPath(); ctx.moveTo(mx, my); ctx.lineTo(mx+nx*s, my+ny*s);
+    ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.stroke();
+    // arrowhead
+    const ax = mx+nx*s, ay = my+ny*s;
+    const angle = Math.atan2(ny, nx);
+    ctx.beginPath();
+    ctx.moveTo(ax, ay);
+    ctx.lineTo(ax - 8*Math.cos(angle-0.5), ay - 8*Math.sin(angle-0.5));
+    ctx.lineTo(ax - 8*Math.cos(angle+0.5), ay - 8*Math.sin(angle+0.5));
+    ctx.closePath(); ctx.fillStyle = color; ctx.fill();
+}
+
+canvas.addEventListener('click', function(e) {
+    const rect = canvas.getBoundingClientRect();
+    const cx = e.clientX - rect.left;
+    const cy = e.clientY - rect.top;
+    const rx = Math.round(cx * canvasScale);
+    const ry = Math.round(cy * canvasScale);
+
+    if (drawMode === 'roi') {
+        if (roiClosed) { roiPoints = []; roiClosed = false; }
+        roiPoints.push([rx, ry]);
+        syncROIToField();
+        redrawCanvas();
+    } else if (drawMode === 'tripwire') {
+        twTemp.push([rx, ry]);
+        if (twTemp.length === 2) {
+            twCounter++;
+            const tw = {
+                id: 'tw' + String(twCounter).padStart(2, '0'),
+                name: '入口线' + twCounter,
+                p1: twTemp[0],
+                p2: twTemp[1],
+                direction: 'left_to_right'
+            };
+            tripwires.push(tw);
+            twTemp = [];
+            syncTWToField();
+            renderTWList();
+        }
+        redrawCanvas();
+    }
+});
+
+function finishROI() {
+    if (roiPoints.length < 3) { toast('禁区至少需要3个点', 'error'); return; }
+    roiClosed = true;
+    syncROIToField();
+    redrawCanvas();
+    toast('禁区已完成', 'success');
+}
+
+function clearDrawing() {
+    roiPoints = []; roiClosed = false; twTemp = []; tripwires = []; twCounter = 0;
+    syncROIToField(); syncTWToField(); renderTWList(); redrawCanvas();
+}
+
+function undoLastPoint() {
+    if (drawMode === 'roi' && roiPoints.length > 0 && !roiClosed) {
+        roiPoints.pop(); syncROIToField(); redrawCanvas();
+    } else if (drawMode === 'tripwire' && twTemp.length > 0) {
+        twTemp.pop(); redrawCanvas();
+    }
+}
+
+function syncROIToField() {
+    document.getElementById('f_roi').value = roiPoints.map(p => p.join(',')).join('\n');
+}
+
+function syncTWToField() {
+    document.getElementById('f_tripwires').value = JSON.stringify(tripwires);
+}
+
+function renderTWList() {
+    const el = document.getElementById('twList');
+    if (tripwires.length === 0) { el.innerHTML = '<span style="color:#666;font-size:12px">暂无入口线，请在画面上绘制</span>'; return; }
+    let html = '';
+    tripwires.forEach((tw, i) => {
+        const color = TW_COLORS[i % TW_COLORS.length];
+        html += '<div class="tw-item"><div class="tw-info">';
+        html += '<span class="tw-color" style="background:' + color + '"></span>';
+        html += '<input value="' + tw.name + '" onchange="updateTW(' + i + ',\'name\',this.value)" placeholder="名称">';
+        html += '<span style="color:#888;font-size:11px">(' + tw.p1.join(',') + ') → (' + tw.p2.join(',') + ')</span>';
+        html += '<select onchange="updateTW(' + i + ',\'direction\',this.value)">';
+        html += '<option value="left_to_right"' + (tw.direction==='left_to_right'?' selected':'') + '>左→右为进入</option>';
+        html += '<option value="right_to_left"' + (tw.direction==='right_to_left'?' selected':'') + '>右→左为进入</option>';
+        html += '</select></div>';
+        html += '<button type="button" class="btn btn-danger btn-sm" onclick="removeTW(' + i + ')">删除</button></div>';
+    });
+    el.innerHTML = html;
+}
+
+function updateTW(idx, key, val) {
+    tripwires[idx][key] = val;
+    syncTWToField(); redrawCanvas();
+}
+
+function removeTW(idx) {
+    tripwires.splice(idx, 1);
+    syncTWToField(); renderTWList(); redrawCanvas();
+}
+</script>
+
+<script>
+/* ===== Modal ===== */
+function openAddModal() {
+    document.getElementById('f_mode').value = 'add';
+    document.getElementById('f_orig_id').value = '';
+    document.getElementById('modalTitle').textContent = '添加摄像头';
+    document.getElementById('camForm').reset();
+    document.getElementById('f_tripwires').value = '[]';
+    roiPoints = []; roiClosed = false; tripwires = []; twTemp = []; twCounter = 0;
+    renderTWList();
+    // 默认告警类型：全部勾选
+    loadAlertTypesToForm([]);
+    document.getElementById('camModal').classList.add('open');
+    setDrawMode('roi');
+    setTimeout(loadSnapshotToCanvas, 200);
+}
+
+async function openEditModal(camId) {
+    try {
+        const r = await fetch('/api/cameras/' + camId);
+        const c = await r.json();
+        document.getElementById('f_mode').value = 'edit';
+        document.getElementById('f_orig_id').value = camId;
+        document.getElementById('modalTitle').textContent = '编辑摄像头 - ' + camId;
+        document.getElementById('f_id').value = c.id || '';
+        document.getElementById('f_name').value = c.name || '';
+        document.getElementById('f_url').value = c.url || '';
+        document.getElementById('f_width').value = c.width || 1280;
+        document.getElementById('f_height').value = c.height || 720;
+        document.getElementById('f_fps').value = c.fps || 15;
+
+        // Load ROI into canvas editor
+        roiPoints = (c.roi && c.roi.length) ? c.roi.map(p => [p[0], p[1]]) : [];
+        roiClosed = roiPoints.length >= 3;
+        syncROIToField();
+
+        // Load tripwires
+        tripwires = (c.tripwires || []).map((tw, i) => ({
+            id: tw.id || 'tw' + (i+1),
+            name: tw.name || '入口线' + (i+1),
+            p1: tw.p1 || [0,0],
+            p2: tw.p2 || [0,0],
+            direction: tw.direction || 'left_to_right'
+        }));
+        twCounter = tripwires.length;
+        syncTWToField();
+        renderTWList();
+
+        // Rules
+        const rules = c.rules || {};
+        const intr = rules.intrusion || {};
+        document.getElementById('f_r_intrusion').checked = !!intr.enabled;
+        document.getElementById('f_r_intrusion_cf').value = intr.confirm_frames || 5;
+        document.getElementById('f_r_intrusion_cd').value = intr.cooldown || 30;
+        document.getElementById('f_r_tripwire').checked = !!(rules.tripwire||{}).enabled;
+        const cnt = rules.counting || {};
+        document.getElementById('f_r_counting').checked = !!cnt.enabled;
+        document.getElementById('f_r_counting_ws').value = cnt.window_seconds || 60;
+        const anom = rules.anomaly || {};
+        const dw = anom.dwell || {};
+        document.getElementById('f_r_dwell').checked = !!dw.enabled;
+        document.getElementById('f_r_dwell_ms').value = dw.max_seconds || 120;
+        document.getElementById('f_r_dwell_cf').value = dw.confirm_frames || 5;
+        document.getElementById('f_r_dwell_cd').value = dw.cooldown || 60;
+        const cr = anom.crowd || {};
+        document.getElementById('f_r_crowd').checked = !!cr.enabled;
+        document.getElementById('f_r_crowd_mc').value = cr.max_count || 5;
+        document.getElementById('f_r_crowd_r').value = cr.radius || 200;
+        document.getElementById('f_r_crowd_cf').value = cr.confirm_frames || 5;
+        document.getElementById('f_r_crowd_cd').value = cr.cooldown || 60;
+        const px = anom.proximity || {};
+        document.getElementById('f_r_prox').checked = !!px.enabled;
+        document.getElementById('f_r_prox_md').value = px.min_distance || 50;
+        document.getElementById('f_r_prox_cf').value = px.confirm_frames || 3;
+        document.getElementById('f_r_prox_cd').value = px.cooldown || 30;
+        const fi = anom.fight || {};
+        document.getElementById('f_r_fight').checked = !!fi.enabled;
+        document.getElementById('f_r_fight_pr').value = fi.proximity_radius || 150;
+        document.getElementById('f_r_fight_ms').value = fi.min_speed || 60;
+        document.getElementById('f_r_fight_mp').value = fi.min_persons || 2;
+        document.getElementById('f_r_fight_cf').value = fi.confirm_frames || 3;
+        document.getElementById('f_r_fight_cd').value = fi.cooldown || 30;
+        const fa = anom.fall || {};
+        document.getElementById('f_r_fall').checked = !!fa.enabled;
+        document.getElementById('f_r_fall_rt').value = fa.ratio_threshold || 1.0;
+        document.getElementById('f_r_fall_rc').value = fa.min_ratio_change || 0.5;
+        document.getElementById('f_r_fall_yd').value = fa.min_y_drop || 20;
+        document.getElementById('f_r_fall_cf').value = fa.confirm_frames || 2;
+        document.getElementById('f_r_fall_cd').value = fa.cooldown || 30;
+
+        // Load alert types
+        loadAlertTypesToForm(rules.alert_types || []);
+
+        document.getElementById('camModal').classList.add('open');
+        setDrawMode('roi');
+        setTimeout(loadSnapshotToCanvas, 200);
+    } catch(e) { toast('加载失败: ' + e, 'error'); }
+}
+
+function closeModal() { document.getElementById('camModal').classList.remove('open'); }
+
+function buildFormData() {
+    let roi = [];
+    const roiText = document.getElementById('f_roi').value.trim();
+    if (roiText) { roi = roiText.split('\n').map(line => { const p = line.trim().split(',').map(Number); return [p[0]||0, p[1]||0]; }); }
+    let tws = [];
+    try { tws = JSON.parse(document.getElementById('f_tripwires').value); } catch(e){}
+    return {
+        id: document.getElementById('f_id').value.trim(),
+        name: document.getElementById('f_name').value.trim(),
+        url: document.getElementById('f_url').value.trim(),
+        width: parseInt(document.getElementById('f_width').value) || 1280,
+        height: parseInt(document.getElementById('f_height').value) || 720,
+        fps: parseInt(document.getElementById('f_fps').value) || 15,
+        roi: roi, tripwires: tws,
+        rules: {
+            intrusion: { enabled: document.getElementById('f_r_intrusion').checked, confirm_frames: parseInt(document.getElementById('f_r_intrusion_cf').value)||5, cooldown: parseFloat(document.getElementById('f_r_intrusion_cd').value)||30 },
+            tripwire: { enabled: document.getElementById('f_r_tripwire').checked },
+            counting: { enabled: document.getElementById('f_r_counting').checked, window_seconds: parseInt(document.getElementById('f_r_counting_ws').value)||60 },
+            anomaly: {
+                dwell: { enabled: document.getElementById('f_r_dwell').checked, max_seconds: parseFloat(document.getElementById('f_r_dwell_ms').value)||120, confirm_frames: parseInt(document.getElementById('f_r_dwell_cf').value)||5, cooldown: parseFloat(document.getElementById('f_r_dwell_cd').value)||60 },
+                crowd: { enabled: document.getElementById('f_r_crowd').checked, max_count: parseInt(document.getElementById('f_r_crowd_mc').value)||5, radius: parseFloat(document.getElementById('f_r_crowd_r').value)||200, confirm_frames: parseInt(document.getElementById('f_r_crowd_cf').value)||5, cooldown: parseFloat(document.getElementById('f_r_crowd_cd').value)||60 },
+                proximity: { enabled: document.getElementById('f_r_prox').checked, min_distance: parseFloat(document.getElementById('f_r_prox_md').value)||50, confirm_frames: parseInt(document.getElementById('f_r_prox_cf').value)||3, cooldown: parseFloat(document.getElementById('f_r_prox_cd').value)||30 },
+                fight: { enabled: document.getElementById('f_r_fight').checked, proximity_radius: parseFloat(document.getElementById('f_r_fight_pr').value)||150, min_speed: parseFloat(document.getElementById('f_r_fight_ms').value)||60, min_persons: parseInt(document.getElementById('f_r_fight_mp').value)||2, confirm_frames: parseInt(document.getElementById('f_r_fight_cf').value)||3, cooldown: parseFloat(document.getElementById('f_r_fight_cd').value)||30 },
+                fall: { enabled: document.getElementById('f_r_fall').checked, ratio_threshold: parseFloat(document.getElementById('f_r_fall_rt').value)||1.0, min_ratio_change: parseFloat(document.getElementById('f_r_fall_rc').value)||0.5, min_y_drop: parseFloat(document.getElementById('f_r_fall_yd').value)||20, confirm_frames: parseInt(document.getElementById('f_r_fall_cf').value)||2, cooldown: parseFloat(document.getElementById('f_r_fall_cd').value)||30 }
+            },
+            alert_types: buildAlertTypes()
+        }
+    };
+}
+
+function buildAlertTypes() {
+    const mapping = [
+        ['f_alert_intrusion', 'intrusion'],
+        ['f_alert_tripwire', 'tripwire'],
+        ['f_alert_presence', 'presence'],
+        ['f_alert_dwell', 'anomaly/dwell'],
+        ['f_alert_crowd', 'anomaly/crowd'],
+        ['f_alert_proximity', 'anomaly/proximity'],
+        ['f_alert_fight', 'anomaly/fight'],
+        ['f_alert_fall', 'anomaly/fall']
+    ];
+    const result = [];
+    mapping.forEach(function(m) {
+        if (document.getElementById(m[0]).checked) result.push(m[1]);
+    });
+    return result;
+}
+
+function loadAlertTypesToForm(alertTypes) {
+    const mapping = {
+        'intrusion': 'f_alert_intrusion',
+        'tripwire': 'f_alert_tripwire',
+        'presence': 'f_alert_presence',
+        'anomaly/dwell': 'f_alert_dwell',
+        'anomaly/crowd': 'f_alert_crowd',
+        'anomaly/proximity': 'f_alert_proximity',
+        'anomaly/fight': 'f_alert_fight',
+        'anomaly/fall': 'f_alert_fall'
+    };
+    // 先全部取消
+    Object.values(mapping).forEach(function(id) { document.getElementById(id).checked = false; });
+    if (!alertTypes || alertTypes.length === 0) {
+        // 空列表=全部告警，全部勾选
+        Object.values(mapping).forEach(function(id) { document.getElementById(id).checked = true; });
+    } else {
+        alertTypes.forEach(function(at) {
+            if (mapping[at]) document.getElementById(mapping[at]).checked = true;
+        });
+    }
+}
+
+async function submitCamForm(e) {
+    e.preventDefault();
+    const mode = document.getElementById('f_mode').value;
+    const data = buildFormData();
+    if (!data.id || !data.url) { toast('ID 和 URL 为必填项', 'error'); return false; }
+    try {
+        let resp;
+        if (mode === 'add') {
+            resp = await fetch('/api/cameras', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) });
+        } else {
+            resp = await fetch('/api/cameras/' + document.getElementById('f_orig_id').value, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) });
+        }
+        const result = await resp.json();
+        if (resp.ok) { toast(result.message || '操作成功', 'success'); closeModal(); loadCamTable(); loadCameras(); }
+        else { toast(result.error || '操作失败', 'error'); }
+    } catch(err) { toast('请求失败: ' + err, 'error'); }
+    return false;
+}
+
+async function deleteCam(camId) {
+    if (!confirm('确定删除摄像头 ' + camId + '？')) return;
+    try {
+        const resp = await fetch('/api/cameras/' + camId, { method: 'DELETE' });
+        const result = await resp.json();
+        if (resp.ok) { toast(result.message || '已删除', 'success'); loadCamTable(); loadCameras(); }
+        else { toast(result.error || '删除失败', 'error'); }
+    } catch(err) { toast('请求失败: ' + err, 'error'); }
+}
+
+/* ===== Init ===== */
+loadCameras();
+connectWS();
+setInterval(updateCounts, 3000);
+</script>
+
+<script>
+/* ===== Training Tab ===== */
+let samplePage = 1, annoPage = 1, jobPollTimer = null;
+
+function switchTrainingSub(name) {
+    document.querySelectorAll('.training-sidebar .nav-item').forEach(b => b.classList.remove('active'));
+    document.querySelector('.nav-item[onclick="switchTrainingSub(\'' + name + '\')"]').classList.add('active');
+    document.querySelectorAll('.training-section').forEach(s => s.classList.remove('active'));
+    document.getElementById('tsec-' + name).classList.add('active');
+    if (name === 'datasets') loadDatasets();
+    else if (name === 'samples') { populateDsSelects(); loadSamples(); }
+    else if (name === 'annotations') { populateDsSelects(); loadAnnotationSamples(); }
+    else if (name === 'jobs') { populateDsSelects(); loadJobs(); }
+    else if (name === 'models') loadModels();
+}
+
+/* ===== Dataset helpers ===== */
+let _datasets = [];
+
+async function populateDsSelects() {
+    try {
+        const r = await fetch('/api/training/datasets');
+        const resp = await r.json(); _datasets = resp.items || resp || [];
+    } catch(e) { _datasets = []; }
+    const ids = ['t_sample_ds','t_sample_filter_ds','t_anno_ds','t_anno_filter_ds','t_job_ds','t_iter_ds'];
+    ids.forEach(id => {
+        const sel = document.getElementById(id);
+        if (!sel) return;
+        const prev = sel.value;
+        sel.innerHTML = '<option value="">-- 选择 --</option>';
+        _datasets.forEach(ds => {
+            const o = document.createElement('option');
+            o.value = ds.name; o.textContent = ds.name;
+            sel.appendChild(o);
+        });
+        if (prev) sel.value = prev;
+    });
+}
+
+/* ===== Datasets ===== */
+async function loadDatasets() {
+    try {
+        const r = await fetch('/api/training/datasets');
+        const resp = await r.json(); _datasets = resp.items || resp || [];
+        const tbody = document.getElementById('t_ds_tbody');
+        if (_datasets.length === 0) { tbody.innerHTML = '<tr><td colspan="5" class="t-empty">暂无数据集</td></tr>'; return; }
+        let html = '';
+        for (const ds of _datasets) {
+            let stats = { total_samples: '-', annotated_count: '-' };
+            try { const sr = await fetch('/api/training/datasets/' + encodeURIComponent(ds.name) + '/stats'); stats = await sr.json(); } catch(e){}
+            html += '<tr><td>' + ds.name + '</td><td>' + (ds.classes||[]).join(', ') + '</td>';
+            html += '<td>' + (stats.total_samples !== undefined ? stats.total_samples : '-') + '</td>';
+            html += '<td>' + (stats.annotated_count !== undefined ? stats.annotated_count : '-') + '</td>';
+            html += '<td><div class="actions"><button class="btn btn-danger btn-sm" onclick="deleteDataset(\'' + ds.name + '\')">删除</button></div></td></tr>';
+        }
+        tbody.innerHTML = html;
+    } catch(e) { toast('加载数据集失败: ' + e, 'error'); }
+}
+
+async function createDataset() {
+    const name = document.getElementById('t_ds_name').value.trim();
+    const classesStr = document.getElementById('t_ds_classes').value.trim();
+    if (!name) { toast('请输入数据集名称', 'error'); return; }
+    const classes = classesStr ? classesStr.split(',').map(s => s.trim()).filter(Boolean) : [];
+    try {
+        const r = await fetch('/api/training/datasets', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name, classes}) });
+        if (r.ok) { toast('数据集创建成功', 'success'); document.getElementById('t_ds_name').value = ''; document.getElementById('t_ds_classes').value = ''; loadDatasets(); }
+        else { const d = await r.json(); toast(d.detail || d.error || '创建失败', 'error'); }
+    } catch(e) { toast('请求失败: ' + e, 'error'); }
+}
+
+async function deleteDataset(name) {
+    if (!confirm('确定删除数据集 ' + name + '？')) return;
+    try {
+        const r = await fetch('/api/training/datasets/' + encodeURIComponent(name), { method:'DELETE' });
+        if (r.ok) { toast('已删除', 'success'); loadDatasets(); }
+        else { const d = await r.json(); toast(d.detail || '删除失败', 'error'); }
+    } catch(e) { toast('请求失败: ' + e, 'error'); }
+}
+
+/* ===== Samples ===== */
+async function uploadSamples() {
+    const ds = document.getElementById('t_sample_ds').value;
+    const files = document.getElementById('t_sample_files').files;
+    if (!ds) { toast('请选择目标数据集', 'error'); return; }
+    if (!files.length) { toast('请选择图片文件', 'error'); return; }
+    const fd = new FormData();
+    for (let i = 0; i < files.length; i++) fd.append('files', files[i]);
+    try {
+        const r = await fetch('/api/training/samples/upload?dataset_name=' + encodeURIComponent(ds), { method:'POST', body: fd });
+        if (r.ok) { const d = await r.json(); toast('上传成功: ' + ((d.items || []).length || files.length) + ' 个文件', 'success'); document.getElementById('t_sample_files').value = ''; loadSamples(); }
+        else { const d = await r.json(); toast(d.detail || '上传失败', 'error'); }
+    } catch(e) { toast('上传失败: ' + e, 'error'); }
+}
+
+async function loadSamples(page) {
+    if (page !== undefined) { if (page < 1) return; samplePage = page; } else { samplePage = 1; }
+    const ds = document.getElementById('t_sample_filter_ds').value;
+    const tbody = document.getElementById('t_sample_tbody');
+    if (!ds) { tbody.innerHTML = '<tr><td colspan="5" class="t-empty">请选择数据集</td></tr>'; return; }
+    try {
+        const r = await fetch('/api/training/samples?dataset_name=' + encodeURIComponent(ds) + '&page=' + samplePage + '&page_size=20');
+        const data = await r.json();
+        const samples = data.items || [];
+        if (!samples || samples.length === 0) { tbody.innerHTML = '<tr><td colspan="5" class="t-empty">暂无样本</td></tr>'; document.getElementById('t_sample_page_info').textContent = '第' + samplePage + '页'; return; }
+        let html = '';
+        samples.forEach(s => {
+            const thumb = s.thumbnail || s.image_path || '';
+            html += '<tr>';
+            html += '<td>' + (thumb ? '<img class="sample-thumb" src="' + thumb + '" onerror="this.style.display=\'none\'">' : '-') + '</td>';
+            html += '<td>' + (s.filename || s.file_name || '-') + '</td>';
+            html += '<td>' + (s.dataset_name || ds) + '</td>';
+            html += '<td>' + (s.annotated ? '✓' : '✗') + '</td>';
+            html += '<td><div class="actions"><button class="btn btn-danger btn-sm" onclick="deleteSample(\'' + s.sample_id + '\')">删除</button></div></td>';
+            html += '</tr>';
+        });
+        tbody.innerHTML = html;
+        const total = data.total || samples.length;
+        document.getElementById('t_sample_page_info').textContent = '第' + samplePage + '页 / 共' + total + '条';
+    } catch(e) { toast('加载样本失败: ' + e, 'error'); }
+}
+
+async function deleteSample(id) {
+    if (!confirm('确定删除该样本？')) return;
+    try {
+        const r = await fetch('/api/training/samples/' + encodeURIComponent(id), { method:'DELETE' });
+        if (r.ok) { toast('已删除', 'success'); loadSamples(samplePage); }
+        else { const d = await r.json(); toast(d.detail || '删除失败', 'error'); }
+    } catch(e) { toast('请求失败: ' + e, 'error'); }
+}
+
+/* ===== Annotations ===== */
+async function autoAnnotate() {
+    const ds = document.getElementById('t_anno_ds').value;
+    const modelPath = document.getElementById('t_anno_model').value.trim();
+    const conf = parseFloat(document.getElementById('t_anno_conf').value) || 0.25;
+    if (!ds) { toast('请选择数据集', 'error'); return; }
+    if (!modelPath) { toast('请输入模型路径', 'error'); return; }
+    try {
+        const r = await fetch('/api/training/datasets/' + encodeURIComponent(ds) + '/auto-annotate', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({ model_path: modelPath, confidence_threshold: conf })
+        });
+        if (r.ok) { const d = await r.json(); toast('自动标注完成: ' + (d.annotated || d.message || '成功'), 'success'); loadAnnotationSamples(); }
+        else { const d = await r.json(); toast(d.detail || '标注失败', 'error'); }
+    } catch(e) { toast('请求失败: ' + e, 'error'); }
+}
+
+async function loadAnnotationSamples(page) {
+    if (page !== undefined) { if (page < 1) return; annoPage = page; } else { annoPage = 1; }
+    const ds = document.getElementById('t_anno_filter_ds').value;
+    const tbody = document.getElementById('t_anno_tbody');
+    if (!ds) { tbody.innerHTML = '<tr><td colspan="4" class="t-empty">请选择数据集</td></tr>'; return; }
+    try {
+        const r = await fetch('/api/training/samples?dataset_name=' + encodeURIComponent(ds) + '&page=' + annoPage + '&page_size=20');
+        const data = await r.json();
+        const samples = data.items || [];
+        if (!samples || samples.length === 0) { tbody.innerHTML = '<tr><td colspan="4" class="t-empty">暂无样本</td></tr>'; document.getElementById('t_anno_page_info').textContent = '第' + annoPage + '页'; return; }
+        let html = '';
+        samples.forEach(s => {
+            const thumb = s.thumbnail || s.image_path || '';
+            const annoCount = s.annotation_count !== undefined ? s.annotation_count : (s.annotated ? '有' : '无');
+            html += '<tr>';
+            html += '<td>' + (thumb ? '<img class="sample-thumb" src="' + thumb + '" onerror="this.style.display=\'none\'">' : '-') + '</td>';
+            html += '<td>' + (s.filename || s.file_name || '-') + '</td>';
+            html += '<td>' + annoCount + '</td>';
+            html += '<td><div class="actions"><button class="btn btn-secondary btn-sm" onclick="viewAnnotations(\'' + s.sample_id + '\')">查看标注</button></div></td>';
+            html += '</tr>';
+        });
+        tbody.innerHTML = html;
+        const total = data.total || samples.length;
+        document.getElementById('t_anno_page_info').textContent = '第' + annoPage + '页 / 共' + total + '条';
+    } catch(e) { toast('加载失败: ' + e, 'error'); }
+}
+
+async function viewAnnotations(sampleId) {
+    try {
+        const r = await fetch('/api/training/samples/' + encodeURIComponent(sampleId) + '/annotations');
+        const data = await r.json();
+        const annos = data.annotations || data;
+        let msg = '标注数量: ' + (Array.isArray(annos) ? annos.length : 0);
+        if (Array.isArray(annos) && annos.length > 0) {
+            msg += '\n\n';
+            annos.slice(0, 10).forEach((a, i) => {
+                msg += (i+1) + '. 类别: ' + (a.class_name || a.label || '-') + ', 置信度: ' + ((a.confidence || 0) * 100).toFixed(1) + '%\n';
+            });
+            if (annos.length > 10) msg += '... 共 ' + annos.length + ' 条';
+        }
+        alert(msg);
+    } catch(e) { toast('加载标注失败: ' + e, 'error'); }
+}
+
+/* ===== Training Jobs ===== */
+async function createJob() {
+    const ds = document.getElementById('t_job_ds').value;
+    if (!ds) { toast('请选择数据集', 'error'); return; }
+    const body = {
+        dataset_name: ds,
+        epochs: parseInt(document.getElementById('t_job_epochs').value) || 50,
+        batch_size: parseInt(document.getElementById('t_job_batch').value) || 16,
+        image_size: parseInt(document.getElementById('t_job_imgsize').value) || 640,
+        base_model: document.getElementById('t_job_base').value.trim() || 'yolov8n.pt'
+    };
+    try {
+        const r = await fetch('/api/training/jobs', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+        if (r.ok) { toast('训练任务已创建', 'success'); loadJobs(); startJobPoll(); }
+        else { const d = await r.json(); toast(d.detail || '创建失败', 'error'); }
+    } catch(e) { toast('请求失败: ' + e, 'error'); }
+}
+
+async function createIterateJob() {
+    const ds = document.getElementById('t_iter_ds').value;
+    const parentSel = document.getElementById('t_iter_parent');
+    const parentId = parentSel.value;
+    if (!ds) { toast('请选择数据集', 'error'); return; }
+    if (!parentId) { toast('请选择父模型', 'error'); return; }
+    const body = {
+        dataset_name: ds,
+        parent_model_id: parentId,
+        epochs: parseInt(document.getElementById('t_iter_epochs').value) || 30,
+        batch_size: parseInt(document.getElementById('t_iter_batch').value) || 16,
+        image_size: parseInt(document.getElementById('t_iter_imgsize').value) || 640
+    };
+    try {
+        const r = await fetch('/api/training/jobs/iterate', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+        if (r.ok) { toast('迭代训练任务已创建', 'success'); loadJobs(); startJobPoll(); }
+        else { const d = await r.json(); toast(d.detail || '创建失败', 'error'); }
+    } catch(e) { toast('请求失败: ' + e, 'error'); }
+}
+
+async function loadJobs() {
+    try {
+        const r = await fetch('/api/training/jobs?page=1&page_size=50');
+        const data = await r.json();
+        const jobs = data.items || [];
+        const tbody = document.getElementById('t_job_tbody');
+        if (!jobs || jobs.length === 0) { tbody.innerHTML = '<tr><td colspan="7" class="t-empty">暂无训练任务</td></tr>'; stopJobPoll(); return; }
+        let hasRunning = false;
+        let html = '';
+        jobs.forEach(j => {
+            const status = j.status || 'pending';
+            if (status === 'running' || status === 'pending') hasRunning = true;
+            const badgeCls = 'badge badge-' + status;
+            const statusText = {pending:'等待中',running:'训练中',completed:'已完成',failed:'失败',cancelled:'已取消'}[status] || status;
+            const progress = (j.current_epoch || 0) / (j.epochs || 1) * 100 || (status === 'completed' ? 100 : 0);
+            const created = j.created_time ? new Date(j.created_time).toLocaleString('zh-CN') : '-';
+            html += '<tr>';
+            html += '<td title="' + (j.job_id || '') + '">' + (j.job_id || '-').substring(0, 8) + '...</td>';
+            html += '<td>' + (j.dataset_name || '-') + '</td>';
+            html += '<td><span class="' + badgeCls + '">' + statusText + '</span></td>';
+            html += '<td style="min-width:120px"><div class="progress-bar-wrap"><div class="progress-bar-fill" style="width:' + progress + '%"></div><div class="progress-bar-text">' + Math.round(progress) + '%</div></div></td>';
+            html += '<td>' + (j.epochs || '-') + '</td>';
+            html += '<td>' + created + '</td>';
+            html += '<td><div class="actions">';
+            if (status === 'running' || status === 'pending') {
+                html += '<button class="btn btn-danger btn-sm" onclick="cancelJob(\'' + j.job_id + '\')">取消</button>';
+            }
+            html += '</div></td>';
+            html += '</tr>';
+        });
+        tbody.innerHTML = html;
+        if (hasRunning) startJobPoll(); else stopJobPoll();
+    } catch(e) { toast('加载任务失败: ' + e, 'error'); }
+}
+
+async function cancelJob(jobId) {
+    if (!confirm('确定取消该训练任务？')) return;
+    try {
+        const r = await fetch('/api/training/jobs/' + encodeURIComponent(jobId) + '/cancel', { method:'POST' });
+        if (r.ok) { toast('任务已取消', 'success'); loadJobs(); }
+        else { const d = await r.json(); toast(d.detail || '取消失败', 'error'); }
+    } catch(e) { toast('请求失败: ' + e, 'error'); }
+}
+
+function startJobPoll() {
+    if (jobPollTimer) return;
+    jobPollTimer = setInterval(loadJobs, 5000);
+}
+
+function stopJobPoll() {
+    if (jobPollTimer) { clearInterval(jobPollTimer); jobPollTimer = null; }
+}
+
+/* ===== Models ===== */
+async function loadModels() {
+    try {
+        const r = await fetch('/api/training/models');
+        const resp = await r.json(); const models = resp.items || [];
+        const tbody = document.getElementById('t_model_tbody');
+        if (!models || models.length === 0) { tbody.innerHTML = '<tr><td colspan="7" class="t-empty">暂无模型</td></tr>'; return; }
+        // Also populate iterate parent select
+        const parentSel = document.getElementById('t_iter_parent');
+        if (parentSel) {
+            const prev = parentSel.value;
+            parentSel.innerHTML = '<option value="">-- 选择父模型 --</option>';
+            models.forEach(m => {
+                const o = document.createElement('option');
+                o.value = m.model_id;
+                o.textContent = (m.model_id || '').substring(0, 12) + ' (' + (m.dataset_name || '-') + ')';
+                parentSel.appendChild(o);
+            });
+            if (prev) parentSel.value = prev;
+        }
+        let html = '';
+        models.forEach(m => {
+            const metrics = m.metrics || {};
+            const map50 = metrics.map50 !== undefined ? (metrics.map50 * 100).toFixed(1) + '%' : '-';
+            const map5095 = metrics.map50_95 !== undefined ? (metrics.map50_95 * 100).toFixed(1) + '%' : '-';
+            const published = m.published;
+            const created = m.created_time ? new Date(m.created_time).toLocaleString('zh-CN') : '-';
+            html += '<tr>';
+            html += '<td title="' + (m.model_id || '') + '">' + (m.model_id || '-').substring(0, 12) + '...</td>';
+            html += '<td>' + (m.dataset_name || '-') + '</td>';
+            html += '<td><span class="metric">' + map50 + '</span></td>';
+            html += '<td><span class="metric">' + map5095 + '</span></td>';
+            html += '<td>' + (published ? '<span class="badge badge-completed">已发布</span>' : '<span class="badge badge-pending">未发布</span>') + '</td>';
+            html += '<td>' + created + '</td>';
+            html += '<td><div class="actions">';
+            if (!published) html += '<button class="btn btn-primary btn-sm" onclick="publishModel(\'' + m.model_id + '\')">发布</button>';
+            html += '<button class="btn btn-danger btn-sm" onclick="deleteModel(\'' + m.model_id + '\')">删除</button>';
+            html += '</div></td>';
+            html += '</tr>';
+        });
+        tbody.innerHTML = html;
+    } catch(e) { toast('加载模型失败: ' + e, 'error'); }
+}
+
+async function publishModel(id) {
+    try {
+        const r = await fetch('/api/training/models/' + encodeURIComponent(id) + '/publish', { method:'POST' });
+        if (r.ok) { toast('模型已发布', 'success'); loadModels(); }
+        else { const d = await r.json(); toast(d.detail || '发布失败', 'error'); }
+    } catch(e) { toast('请求失败: ' + e, 'error'); }
+}
+
+async function deleteModel(id) {
+    if (!confirm('确定删除该模型？')) return;
+    try {
+        const r = await fetch('/api/training/models/' + encodeURIComponent(id), { method:'DELETE' });
+        if (r.ok) { toast('已删除', 'success'); loadModels(); }
+        else { const d = await r.json(); toast(d.detail || '删除失败', 'error'); }
+    } catch(e) { toast('请求失败: ' + e, 'error'); }
+}
+
+/* ===== Hook into tab switch ===== */
+const _origSwitchTab = switchTab;
+switchTab = function(name) {
+    _origSwitchTab(name);
+    if (name === 'training') {
+        const activeSub = document.querySelector('.training-section.active');
+        const subName = activeSub ? activeSub.id.replace('tsec-', '') : 'datasets';
+        switchTrainingSub(subName);
+    } else {
+        stopJobPoll();
+    }
+};
+</script>
+</body>
+</html>

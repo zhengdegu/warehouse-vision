@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# Models (large files)
+*.pt
+*.onnx
+
+# Data
+data/warehouse_vision.db
+data/warehouse_vision.db-shm
+data/warehouse_vision.db-wal
+data/samples/*/
+data/labels/warehouse_v1/
+data/models/*/
+data/training/*/
+data/metadata/*.json
+!data/**/.gitkeep
+
+# Events output
+events/
+
+# Training runs
+runs/
+
+# Node
+web/node_modules/
+web/dist/
+
+# IDE
+.vscode/
+.kiro/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+*.log
+
+# Env
+.env
