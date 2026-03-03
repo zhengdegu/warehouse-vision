@@ -26,12 +26,22 @@ export function EventsPage() {
   const [page, setPage] = useState(0)
   const [camFilter, setCamFilter] = useState('')
   const [typeFilter, setTypeFilter] = useState('')
-  const [cameras, setCameras] = useState<{ id: string; name: string }[]>([])
+  const [cameras, setCameras] = useState<{ id: string; name: string; timezone?: string }[]>([])
   const [detail, setDetail] = useState<EventItem | null>(null)
   const [summary, setSummary] = useState<Record<string, unknown>>({})
   const limit = 30
 
   useEffect(() => { api.getCameras().then(setCameras).catch(() => {}) }, [])
+
+  // 摄像头时区映射
+  const tzMap: Record<string, string> = {}
+  for (const c of cameras) {
+    if (c.timezone) tzMap[c.id] = c.timezone
+  }
+  const fmtTime = (ts: number, cameraId?: string) => {
+    const tz = cameraId ? tzMap[cameraId] : undefined
+    return new Date(ts * 1000).toLocaleString('zh-CN', tz ? { timeZone: tz } : undefined)
+  }
   useEffect(() => { api.getEventSummary().then(setSummary).catch(() => {}) }, [])
 
   useEffect(() => {
@@ -102,7 +112,7 @@ export function EventsPage() {
               const b = badge(evt)
               return (
                 <tr key={i} onClick={() => setDetail(evt)} className="border-t border-border/30 hover:bg-card/40 cursor-pointer transition-colors">
-                  <td className="px-4 py-3 text-muted whitespace-nowrap font-mono text-xs">{new Date((evt.timestamp as number) * 1000).toLocaleString('zh-CN')}</td>
+                  <td className="px-4 py-3 text-muted whitespace-nowrap font-mono text-xs">{fmtTime(evt.timestamp as number, evt.camera_id as string)}</td>
                   <td className="px-4 py-3"><span className={`px-2 py-0.5 rounded-lg text-[11px] font-medium ${b.cls}`}>{b.label}</span></td>
                   <td className="px-4 py-3 text-muted text-xs">{evt.camera_id as string}</td>
                   <td className="px-4 py-3 text-muted truncate max-w-[280px] text-xs">{(evt.detail as string) || (evt.class_name as string) || '-'}</td>
@@ -138,7 +148,7 @@ export function EventsPage() {
               <div className="w-full h-44 bg-bg-elevated rounded-xl mb-4 flex items-center justify-center text-muted text-sm border border-border">无截图</div>
             )}
             <dl className="grid grid-cols-[90px_1fr] gap-x-4 gap-y-2 text-sm">
-              <dt className="text-muted">时间</dt><dd className="font-mono text-xs">{new Date((detail.timestamp as number) * 1000).toLocaleString('zh-CN')}</dd>
+              <dt className="text-muted">时间</dt><dd className="font-mono text-xs">{fmtTime(detail.timestamp as number, detail.camera_id as string)}</dd>
               <dt className="text-muted">摄像头</dt><dd>{(detail.camera_id as string) || '-'}</dd>
               {detail.class_name ? <><dt className="text-muted">类别</dt><dd>{detail.class_name as string}</dd></> : null}
               {detail.crossing_direction ? <><dt className="text-muted">方向</dt><dd>{detail.crossing_direction === 'in' ? '进入' : '离开'}</dd></> : null}

@@ -99,7 +99,7 @@ def main():
     global points
     try:
         while True:
-            frame = reader.read_latest()
+            frame, _ = reader.read_latest()
             if frame is not None:
                 display = draw_polygon(frame)
                 cv2.imshow(window_name, display)

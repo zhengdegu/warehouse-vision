@@ -28,6 +28,7 @@ const defaultForm = {
       proximity: { enabled: false, min_distance: 50, confirm_frames: 3, cooldown: 30 },
       fight: { enabled: false, proximity_radius: 150, min_speed: 60, min_persons: 2, confirm_frames: 3, cooldown: 30 },
       fall: { enabled: false, ratio_threshold: 1.0, min_ratio_change: 0.5, min_y_drop: 20, confirm_frames: 2, cooldown: 30 },
+      time_period: { enabled: false, start: '00:00', end: '23:59', days: [0, 1, 2, 3, 4, 5, 6] },
     },
     alert_types: [] as string[],
   },
@@ -262,6 +263,42 @@ export function CameraModal({ mode, camId, onClose, onSaved }: Props) {
                   <Field label="最小Y下降(px)" value={form.rules.anomaly.fall.min_y_drop} onChange={v => set('rules.anomaly.fall.min_y_drop', Number(v))} type="number" />
                   <Field label="确认帧数" value={form.rules.anomaly.fall.confirm_frames} onChange={v => set('rules.anomaly.fall.confirm_frames', Number(v))} type="number" />
                   <Field label="冷却时间(秒)" value={form.rules.anomaly.fall.cooldown} onChange={v => set('rules.anomaly.fall.cooldown', Number(v))} type="number" />
+                </div>
+              )}
+            </RuleSection>
+
+            {/* Time Period Constraint */}
+            <RuleSection>
+              <Toggle label="时间周期约束（异常检测）" path="rules.anomaly.time_period.enabled" />
+              {form.rules.anomaly.time_period.enabled && (
+                <div className="mt-2 space-y-3">
+                  <div className="grid grid-cols-2 gap-3 text-sm">
+                    <Field label="开始时间" value={form.rules.anomaly.time_period.start} onChange={v => set('rules.anomaly.time_period.start', v)} />
+                    <Field label="结束时间" value={form.rules.anomaly.time_period.end} onChange={v => set('rules.anomaly.time_period.end', v)} />
+                  </div>
+                  <div>
+                    <span className="text-xs text-muted mb-1.5 block">生效日期</span>
+                    <div className="flex gap-1.5">
+                      {['一', '二', '三', '四', '五', '六', '日'].map((d, i) => {
+                        const active = form.rules.anomaly.time_period.days.includes(i)
+                        return (
+                          <button key={i} type="button" onClick={() => {
+                            const days = active
+                              ? form.rules.anomaly.time_period.days.filter((x: number) => x !== i)
+                              : [...form.rules.anomaly.time_period.days, i].sort()
+                            set('rules.anomaly.time_period.days', days)
+                          }}
+                            className={`w-8 h-8 rounded-lg text-xs font-medium cursor-pointer transition-colors ${
+                              active ? 'bg-accent text-white' : 'bg-bg-elevated text-muted hover:text-foreground'
+                            }`}
+                          >
+                            {d}
+                          </button>
+                        )
+                      })}
+                    </div>
+                  </div>
+                  <p className="text-[10px] text-muted">仅在选定的时间段和日期内运行异常行为检测（徘徊/跌倒/聚集/打架）</p>
                 </div>
               )}
             </RuleSection>

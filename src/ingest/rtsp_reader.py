@@ -20,12 +20,21 @@ class RTSPReader:
     """RTSP 拉流器，基于 ffmpeg subprocess"""
 
     def __init__(self, url: str, width: int = 0, height: int = 0,
-                 fps: int = 15, reconnect_delay: float = 3.0):
+                 fps: int = 15, reconnect_delay: float = 3.0,
+                 time_offset: float = None):
+        """
+        Args:
+            time_offset: 摄像头时间与本地时间的偏移量（秒），
+                         camera_time = local_time + time_offset。
+                         None 表示启动时自动探测，0 表示不修正。
+        """
         self.url = url
         self.width = width
         self.height = height
         self.fps = fps
         self.reconnect_delay = reconnect_delay
+        self._time_offset: float = time_offset if time_offset is not None else 0.0
+        self._auto_detect_offset = time_offset is None
 
         self._frame_size = 0  # 启动时根据实际分辨率计算
         self._queue: Queue = Queue(maxsize=1)
@@ -35,34 +44,52 @@ class RTSPReader:
 
     def _build_ffmpeg_cmd(self) -> list:
         """构建 ffmpeg 命令行"""
-        return [
+        cmd = [
             "ffmpeg",
             "-fflags", "+genpts+discardcorrupt+nobuffer",
             "-rtsp_transport", "tcp",
-            "-timeout", "5000000",         # RTSP 超时 5s（微秒）
-            "-analyzeduration", "2000000", # 缩短探测时间 2s
-            "-probesize", "1000000",       # 缩小探测大小 1MB
+            "-timeout", "10000000",        # RTSP 超时 10s（微秒）
+            "-analyzeduration", "10000000", # 探测时间 10s（解决 MPEG4 解析问题）
+            "-probesize", "5000000",        # 探测大小 5MB
             "-flags", "+low_delay",
             "-err_detect", "ignore_err",
             "-i", self.url,
-            "-vf", f"scale={self.width}:{self.height},fps={self.fps}",
+        ]
+        # 只有指定了分辨率才做缩放
+        if self.width > 0 and self.height > 0:
+            cmd.extend(["-vf", f"scale={self.width}:{self.height},fps={self.fps}"])
+        else:
+            cmd.extend(["-vf", f"fps={self.fps}"])
+        cmd.extend([
             "-f", "rawvideo",
             "-pix_fmt", "bgr24",
             "-an",              # 不要音频
             "-sn",              # 不要字幕
             "-loglevel", "warning",
             "-"
-        ]
+        ])
+        return cmd
 
     def _drain_stderr(self, proc: subprocess.Popen):
-        """读取并丢弃 stderr，防止 pipe buffer 满导致 ffmpeg 阻塞"""
+        """读取 stderr，只打印关键错误信息"""
         try:
             for line in proc.stderr:
                 if isinstance(line, bytes):
                     line = line.decode("utf-8", errors="replace")
                 line = line.strip()
-                if line:
-                    logger.debug(f"ffmpeg stderr: {line}")
+                if not line:
+                    continue
+                # 过滤掉重复的解码警告，只保留关键错误
+                if any(skip in line for skip in [
+                    "Last message repeated",
+                    "VOL Header truncated", 
+                    "PPS id out of range",
+                    "Skipping invalid undecodable NALU",
+                    "Could not find ref with POC",
+                    "deprecated pixel format",
+                ]):
+                    continue
+                logger.warning(f"ffmpeg: {line}")
         except Exception:
             pass
 
@@ -96,6 +123,8 @@ class RTSPReader:
                     frame = np.frombuffer(raw, dtype=np.uint8).reshape(
                         (self.height, self.width, 3)
                     )
+                    # 使用摄像头时间：本地时间 + 偏移量
+                    capture_ts = time.time() + self._time_offset
 
                     # Queue(maxsize=1)：丢弃旧帧，只保留最新帧
                     try:
@@ -103,7 +132,7 @@ class RTSPReader:
                     except Exception:
                         pass
                     try:
-                        self._queue.put_nowait(frame)
+                        self._queue.put_nowait((frame, capture_ts))
                     except Full:
                         pass
 
@@ -126,7 +155,7 @@ class RTSPReader:
                 pass
             self._process = None
 
-    def probe_resolution(self, timeout: float = 10.0) -> tuple:
+    def probe_resolution(self, timeout: float = 15.0) -> tuple:
         """
         用 ffprobe 探测 RTSP 流的原始分辨率。
         返回 (width, height)，失败返回 (0, 0)。
@@ -155,6 +184,48 @@ class RTSPReader:
             logger.warning(f"ffprobe 探测失败: {e}")
         return 0, 0
 
+    def probe_time_offset(self, timeout: float = 10.0) -> float:
+        """
+        探测摄像头时间与本地时间的偏移量。
+        通过 ffprobe 获取 RTSP 流的 start_time（基于 NTP/RTCP），
+        与本地时间对比得到偏移量。
+        返回偏移量（秒），camera_time = local_time + offset。
+        探测失败返回 0.0。
+        """
+        cmd = [
+            "ffprobe",
+            "-rtsp_transport", "tcp",
+            "-v", "quiet",
+            "-print_format", "json",
+            "-show_format",
+            self.url,
+        ]
+        try:
+            before = time.time()
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=timeout
+            )
+            after = time.time()
+            probe_local_time = (before + after) / 2  # 取探测中间时刻
+
+            info = json.loads(result.stdout)
+            fmt = info.get("format", {})
+            # start_time 是流的起始 PTS（秒），对于 RTSP 通常基于 NTP
+            start_time_str = fmt.get("start_time")
+            if start_time_str:
+                stream_time = float(start_time_str)
+                # 对于某些摄像头，start_time 是 Unix epoch 秒
+                # 如果值很大（>1e9），说明是绝对时间戳
+                if stream_time > 1e9:
+                    offset = stream_time - probe_local_time
+                    logger.info(f"探测到摄像头时间偏移: {offset:+.2f}s "
+                                f"(摄像头={stream_time:.0f}, 本地={probe_local_time:.0f})")
+                    return offset
+            logger.info("未能从流中获取绝对时间戳，使用本地时间（偏移=0）")
+        except Exception as e:
+            logger.warning(f"时间偏移探测失败: {e}")
+        return 0.0
+
     def start(self):
         """启动拉流线程"""
         if self._running:
@@ -172,18 +243,24 @@ class RTSPReader:
                 self.height = self.height or 720
                 logger.warning(f"探测失败，使用默认分辨率: {self.width}x{self.height}")
 
+        # 跳过时间偏移探测（太慢且经常超时），直接使用配置值或默认 0
+        if self._auto_detect_offset:
+            # 不再自动探测，直接用 0
+            self._time_offset = 0.0
+            logger.info(f"使用本地时间（偏移=0）")
+
         self._frame_size = self.width * self.height * 3
         self._running = True
         self._thread = threading.Thread(target=self._read_loop, daemon=True)
         self._thread.start()
         logger.info(f"RTSPReader 已启动: {self.url} ({self.width}x{self.height})")
 
-    def read_latest(self) -> np.ndarray | None:
-        """获取最新帧，非阻塞"""
+    def read_latest(self) -> tuple:
+        """获取最新帧，非阻塞。返回 (frame, capture_ts) 或 (None, 0.0)"""
         try:
             return self._queue.get_nowait()
         except Exception:
-            return None
+            return None, 0.0
 
     def stop(self):
         """停止拉流"""

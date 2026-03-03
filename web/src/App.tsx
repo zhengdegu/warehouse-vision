@@ -6,6 +6,7 @@ import { EventsPage } from './pages/EventsPage'
 import { ConfigPage } from './pages/ConfigPage'
 import { TrainingPage } from './pages/TrainingPage'
 import { SystemPage } from './pages/SystemPage'
+import { AccuracyPage } from './pages/AccuracyPage'
 import { WebSocketProvider } from './hooks/useWebSocket'
 
 export default function App() {
@@ -19,6 +20,7 @@ export default function App() {
               <Route path="/" element={<Navigate to="/live" replace />} />
               <Route path="/live" element={<LivePage />} />
               <Route path="/events" element={<EventsPage />} />
+              <Route path="/accuracy" element={<AccuracyPage />} />
               <Route path="/config" element={<ConfigPage />} />
               <Route path="/training" element={<TrainingPage />} />
               <Route path="/system" element={<SystemPage />} />

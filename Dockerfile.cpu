@@ -15,6 +15,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
+# 限制 CPU 推理线程，降低多核争抢
+ENV OMP_NUM_THREADS=2
+ENV MKL_NUM_THREADS=2
+
 RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
 COPY requirements.txt .

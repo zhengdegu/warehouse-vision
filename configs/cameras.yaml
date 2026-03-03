@@ -1,6 +1,6 @@
 cameras:
-- fps: 15
-  height: 720
+- fps: 5
+  height: 480
   id: cam_02
   motion:
     contour_area: 200
@@ -58,6 +58,18 @@ cameras:
         cooldown: 30.0
         enabled: true
         min_distance: 50.0
+      time_period:
+        days:
+        - 0
+        - 1
+        - 2
+        - 3
+        - 4
+        - 5
+        - 6
+        enabled: false
+        end: '23:59'
+        start: 00:00
     counting:
       enabled: true
       window_seconds: 60
@@ -69,9 +81,9 @@ cameras:
       enabled: true
   tripwires: []
   url: rtsp://172.19.1.30:8554/sms/HCPEurl/commonvideobiz_4Dxnr%2BboWz5iI%2Bg%2B8oOENYQLEjfbrirdRK%2BYUx5nReApUTJjRd3lI%2Fb9rBogq%2FiA6zuiyETvt0%2FYjGC0T%2FNLrVqKMMg5z8YFdRsdQbDFtaSNX2pn7VEiFVP5Y%2FMG45TptXi3U9WUb6WakmI%2FKy2GoNzKAPvp0Jz675s2v6qeiwu0FIij59cFireJti8gFbkuYj57JfMBd%2BVmUMAYyn3dHKBgXBmoZOJ6JVmB7ml50ksWPqcGt65QgLvcLmYX315%2BoPnH3eCdh0qiFtHXmYsrX9NetOJzkvaHbiQ%2BBo%2Fc1PU%3D
-  width: 1280
-- fps: 15
-  height: 720
+  width: 680
+- fps: 5
+  height: 480
   id: cam01
   motion:
     contour_area: 200
@@ -80,16 +92,16 @@ cameras:
     threshold: 40
   name: 停车场入口
   roi:
-  - - 360.0
-    - 236.0
-  - - 45.0
-    - 310.0
-  - - 123.0
-    - 661.0
-  - - 751.0
-    - 362.0
-  - - 369.0
-    - 227.0
+  - - 18.0
+    - 140.0
+  - - 73.0
+    - 466.0
+  - - 502.0
+    - 237.0
+  - - 506.0
+    - 157.0
+  - - 227.0
+    - 75.0
   rules:
     alert_types:
     - intrusion
@@ -131,6 +143,18 @@ cameras:
         cooldown: 30.0
         enabled: true
         min_distance: 50.0
+      time_period:
+        days:
+        - 0
+        - 1
+        - 2
+        - 3
+        - 4
+        - 5
+        - 6
+        enabled: false
+        end: '23:59'
+        start: 00:00
     counting:
       enabled: true
       window_seconds: 60
@@ -141,17 +165,85 @@ cameras:
     tripwire:
       enabled: true
   tripwires:
-  - cooldown: 2.0
+  - cooldown: 0.5
     direction: right_to_left
-    id: tw01
-    name: 入口线1
+    id: tw9380
+    name: 线2
     p1:
-    - 149.0
-    - 710.0
+    - 68.0
+    - 472.0
     p2:
-    - 1105.0
-    - 362.0
+    - 557.0
+    - 239.0
   url: rtsp://172.19.1.30:8554/sms/HCPEurl/commonvideobiz_4Dxnr%2BboWz5iI%2Bg%2B8oOENYQLEjfbrirdRK%2BYUx5nReCzgUndBTGPd477ejIKDKDOPJzM2S93V36oizUIpiQ99YWmTlkVJudIkdpgR2cciszZAfeDrpq1khSeXsPVWsirdjKubbiL716xv7UaYCbS0t%2BQg0x9Gin3LeBkeL8KSrpHE1smcr4JRdU3KkpscmDUgRIp4z9nlymPRG%2B7yzO%2BoFepLGAwEWv%2FYjPbE7XM5h7so36k5%2Bv0ifOEsR8YHeove%2FurP8da3vufJJeO1N6dGzEU7hiUui6z67Qx2BtAU1U%3D
+  width: 640
+- fps: 15
+  height: 720
+  id: '1'
+  motion:
+    contour_area: 200
+    enabled: false
+    frame_alpha: 0.02
+    threshold: 40
+  name: '1'
+  roi: []
+  rules:
+    alert_types:
+    - presence
+    anomaly:
+      crowd:
+        confirm_frames: 5
+        cooldown: 60.0
+        enabled: false
+        max_count: 5
+        radius: 200.0
+      dwell:
+        confirm_frames: 5
+        cooldown: 60.0
+        enabled: false
+        max_seconds: 120.0
+      fall:
+        confirm_frames: 2
+        cooldown: 30.0
+        enabled: false
+        min_ratio_change: 0.5
+        min_y_drop: 20.0
+        ratio_threshold: 1.0
+      fight:
+        confirm_frames: 3
+        cooldown: 30.0
+        enabled: false
+        min_persons: 2
+        min_speed: 60.0
+        proximity_radius: 150.0
+      proximity:
+        confirm_frames: 3
+        cooldown: 30.0
+        enabled: false
+        min_distance: 50.0
+      time_period:
+        days:
+        - 0
+        - 1
+        - 2
+        - 3
+        - 4
+        - 5
+        - 6
+        enabled: false
+        end: '23:59'
+        start: 00:00
+    counting:
+      enabled: false
+      window_seconds: 60
+    intrusion:
+      confirm_frames: 5
+      cooldown: 30.0
+      enabled: false
+    tripwire:
+      enabled: false
+  tripwires: []
+  url: rtsp://172.19.1.30:8554/sms/HCPEurl/commonvideobiz_4Dxnr%2BboWz5iI%2Bg%2B8oOENYQLEjfbrirdRK%2BYUx5nReDMEgUnupuIfSxMM%2BJTbZxaB6Dz1W08VZ2SJ2tW2aPPLph9%2BO9HN%2BjsZN06t%2Blgomh4x1UPyLH%2FHogDc2F2s8ke0dOcr34KP0bCegL5uWDZSIK7hqxXZVvVUxSO4sKfj4rrAyCjInVcA9NeHTpoKvbRzs2Q0Tn5AVV0IWxTc%2FJ%2BohdXFkTK7T9rlQhS9xXWinzegVQh%2FrqaXyoPqlr4TQfS
   width: 1280
 database:
   path: data/warehouse_vision.db
@@ -166,7 +258,7 @@ events:
   output_dir: events
   screenshot: true
 model:
-  analyze_fps: 5
+  analyze_fps: 3
   classes:
   - 0
   - 1
@@ -178,7 +270,7 @@ model:
   path: yolo26m.pt
   pose:
     confidence: 0.3
-    enabled: true
+    enabled: false
     path: yolo26m-pose.pt
 system:
   log_level: INFO

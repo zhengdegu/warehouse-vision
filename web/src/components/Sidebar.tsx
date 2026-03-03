@@ -1,9 +1,10 @@
 import { NavLink } from 'react-router-dom'
-import { Video, Bell, Settings, Brain, Activity, Shield } from 'lucide-react'
+import { Video, Bell, Settings, Brain, Activity, Shield, BarChart3 } from 'lucide-react'
 
 const nav = [
   { to: '/live', icon: Video, label: '监控' },
   { to: '/events', icon: Bell, label: '事件' },
+  { to: '/accuracy', icon: BarChart3, label: '准确率' },
   { to: '/config', icon: Settings, label: '配置' },
   { to: '/training', icon: Brain, label: '训练' },
   { to: '/system', icon: Activity, label: '系统' },

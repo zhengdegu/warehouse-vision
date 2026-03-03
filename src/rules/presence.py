@@ -35,9 +35,10 @@ class PresenceDetector:
 
 
     def update(self, detections: List[Detection],
-               camera_id: str = "") -> List[Dict[str, Any]]:
+               camera_id: str = "",
+               frame_ts: float = 0.0) -> List[Dict[str, Any]]:
         events = []
-        now = time.time()
+        now = frame_ts if frame_ts > 0 else time.time()
 
         for det in detections:
             if det.track_id < 0:

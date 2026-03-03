@@ -95,6 +95,43 @@ class EventDatabase:
                 memory_mb REAL DEFAULT 0,
                 timestamp REAL NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS accuracy_stats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                camera_id TEXT NOT NULL DEFAULT '',
+                rule_type TEXT NOT NULL,
+                sub_type TEXT DEFAULT '',
+                total_alerts INTEGER DEFAULT 0,
+                confirmed INTEGER DEFAULT 0,
+                false_positive INTEGER DEFAULT 0,
+                missed INTEGER DEFAULT 0,
+                precision REAL DEFAULT 0,
+                recall REAL DEFAULT 0,
+                f1 REAL DEFAULT 0,
+                period_start REAL NOT NULL,
+                period_end REAL NOT NULL,
+                created_at TEXT DEFAULT (datetime('now', 'localtime'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_accuracy_camera
+                ON accuracy_stats(camera_id, rule_type, period_end DESC);
+
+            CREATE TABLE IF NOT EXISTS area_counts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                camera_id TEXT NOT NULL,
+                person INTEGER DEFAULT 0,
+                car INTEGER DEFAULT 0,
+                truck INTEGER DEFAULT 0,
+                motorcycle INTEGER DEFAULT 0,
+                bicycle INTEGER DEFAULT 0,
+                bus INTEGER DEFAULT 0,
+                total INTEGER DEFAULT 0,
+                timestamp REAL NOT NULL,
+                created_at TEXT DEFAULT (datetime('now', 'localtime'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_area_counts_camera
+                ON area_counts(camera_id, timestamp DESC);
         """)
         conn.commit()
 
@@ -144,6 +181,26 @@ class EventDatabase:
             count.get("total_out", 0),
             json.dumps(count.get("by_class", {}), ensure_ascii=False),
             count.get("timestamp", time.time()),
+        ))
+        conn.commit()
+
+    def insert_area_count(self, record: Dict[str, Any]):
+        """插入区域内目标计数记录"""
+        conn = self._get_conn()
+        conn.execute("""
+            INSERT INTO area_counts
+                (camera_id, person, car, truck, motorcycle, bicycle, bus, total, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            record.get("camera_id", ""),
+            record.get("person", 0),
+            record.get("car", 0),
+            record.get("truck", 0),
+            record.get("motorcycle", 0),
+            record.get("bicycle", 0),
+            record.get("bus", 0),
+            record.get("total", 0),
+            record.get("timestamp", time.time()),
         ))
         conn.commit()
 
@@ -315,6 +372,132 @@ class EventDatabase:
             "DELETE FROM system_stats WHERE timestamp < ?",
             (time.time() - 7 * 86400,)  # 系统统计只保留 7 天
         )
+        conn.execute(
+            "DELETE FROM accuracy_stats WHERE period_end < ?", (cutoff,)
+        )
         conn.commit()
         if deleted:
             logger.info(f"已清理 {deleted} 条过期事件 (>{retain_days}天)")
+
+    # ── 准确率统计 ────────────────────────────────────────────────────────
+
+    def compute_accuracy_stats(self, camera_id: str = None,
+                               hours: int = 24) -> List[Dict]:
+        """从事件数据库中计算各规则类型的报警统计"""
+        conn = self._get_conn()
+        since = time.time() - hours * 3600
+        params: list = [since]
+        cam_filter = ""
+        if camera_id:
+            cam_filter = "AND camera_id = ?"
+            params.append(camera_id)
+
+        rows = conn.execute(f"""
+            SELECT event_type, sub_type, camera_id,
+                   COUNT(*) as total_alerts,
+                   AVG(confidence) as avg_confidence,
+                   MIN(timestamp) as first_event,
+                   MAX(timestamp) as last_event
+            FROM events
+            WHERE timestamp >= ? {cam_filter}
+            GROUP BY event_type, sub_type, camera_id
+            ORDER BY total_alerts DESC
+        """, params).fetchall()
+
+        results = []
+        for r in rows:
+            results.append({
+                "rule_type": r["event_type"],
+                "sub_type": r["sub_type"] or "",
+                "camera_id": r["camera_id"],
+                "total_alerts": r["total_alerts"],
+                "avg_confidence": round(r["avg_confidence"] or 0, 3),
+                "first_event": r["first_event"],
+                "last_event": r["last_event"],
+            })
+        return results
+
+    def get_accuracy_records(self, camera_id: str = None,
+                             rule_type: str = None,
+                             limit: int = 50) -> List[Dict]:
+        """查询已保存的准确率评估记录"""
+        conn = self._get_conn()
+        conditions = []
+        params: list = []
+        if camera_id:
+            conditions.append("camera_id = ?")
+            params.append(camera_id)
+        if rule_type:
+            conditions.append("rule_type = ?")
+            params.append(rule_type)
+        where = " AND ".join(conditions) if conditions else "1=1"
+        rows = conn.execute(f"""
+            SELECT * FROM accuracy_stats
+            WHERE {where}
+            ORDER BY period_end DESC
+            LIMIT ?
+        """, params + [limit]).fetchall()
+        return [dict(r) for r in rows]
+
+    def save_accuracy_record(self, record: Dict[str, Any]) -> int:
+        """保存一条准确率评估记录"""
+        conn = self._get_conn()
+        cur = conn.execute("""
+            INSERT INTO accuracy_stats
+                (camera_id, rule_type, sub_type, total_alerts, confirmed,
+                 false_positive, missed, precision, recall, f1,
+                 period_start, period_end)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            record.get("camera_id", ""),
+            record.get("rule_type", ""),
+            record.get("sub_type", ""),
+            record.get("total_alerts", 0),
+            record.get("confirmed", 0),
+            record.get("false_positive", 0),
+            record.get("missed", 0),
+            record.get("precision", 0),
+            record.get("recall", 0),
+            record.get("f1", 0),
+            record.get("period_start", 0),
+            record.get("period_end", 0),
+        ))
+        conn.commit()
+        return cur.lastrowid
+
+    def get_alert_trend(self, camera_id: str = None,
+                        hours: int = 24,
+                        bucket_minutes: int = 60) -> List[Dict]:
+        """获取报警趋势数据（按时间桶聚合）"""
+        conn = self._get_conn()
+        since = time.time() - hours * 3600
+        bucket_secs = bucket_minutes * 60
+        params: list = [bucket_secs, since]
+        cam_filter = ""
+        if camera_id:
+            cam_filter = "AND camera_id = ?"
+            params.append(camera_id)
+
+        rows = conn.execute(f"""
+            SELECT
+                CAST((timestamp / ?) AS INTEGER) * ? as bucket,
+                event_type,
+                sub_type,
+                COUNT(*) as cnt
+            FROM events
+            WHERE timestamp >= ? {cam_filter}
+            GROUP BY bucket, event_type, sub_type
+            ORDER BY bucket ASC
+        """, [bucket_secs, bucket_secs, since] + ([camera_id] if camera_id else [])).fetchall()
+
+        results = []
+        for r in rows:
+            key = r["event_type"]
+            if r["sub_type"]:
+                key += f"/{r['sub_type']}"
+            results.append({
+                "timestamp": r["bucket"],
+                "type": key,
+                "count": r["cnt"],
+            })
+        return results

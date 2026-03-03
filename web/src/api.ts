@@ -61,4 +61,10 @@ export const api = {
   getModels: () => request<{ items: Record<string, unknown>[] }>('/api/training/models'),
   publishModel: (id: string) => request(`/api/training/models/${id}/publish`, { method: 'POST' }),
   deleteModel: (id: string) => request(`/api/training/models/${id}`, { method: 'DELETE' }),
+
+  // ── Accuracy ──
+  getAccuracyStats: (params?: string) => request<{ items: Record<string, unknown>[]; summary: Record<string, unknown> }>(`/api/accuracy/stats${params ? '?' + params : ''}`),
+  getAccuracyTrend: (params?: string) => request<{ items: Record<string, unknown>[] }>(`/api/accuracy/trend${params ? '?' + params : ''}`),
+  getAccuracyRecords: (params?: string) => request<{ items: Record<string, unknown>[] }>(`/api/accuracy/records${params ? '?' + params : ''}`),
+  saveAccuracyRecord: (data: unknown) => request('/api/accuracy/records', json(data)),
 }

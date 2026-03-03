@@ -1,10 +1,11 @@
 import { useEffect, useState, useRef, useCallback } from 'react'
 import { api } from '../api'
 import { AlertPanel } from '../components/AlertPanel'
-import { ChevronDown, ArrowDownLeft, ArrowUpRight, Activity, AlertTriangle, Radio, Grid2x2, Maximize2, Camera } from 'lucide-react'
+import { ChevronDown, ArrowDownLeft, ArrowUpRight, AlertTriangle, Radio, Grid2x2, Maximize2, Camera, Users, Car } from 'lucide-react'
 
 type CameraInfo = { id: string; name: string }
-type Counts = Record<string, number>
+type AreaCounts = { total?: number; person?: number; car?: number; truck?: number; bus?: number; motorcycle?: number; bicycle?: number }
+type Counts = Record<string, number | AreaCounts>
 
 export function LivePage() {
   const [cameras, setCameras] = useState<CameraInfo[]>([])
@@ -50,11 +51,13 @@ export function LivePage() {
     } catch {}
   }, [current])
 
+  const area = (counts.area || {}) as AreaCounts
   const stats = [
-    { label: '进入', val: counts.total_in ?? 0, icon: ArrowDownLeft, cls: 'text-success', bg: 'bg-success-dim' },
-    { label: '离开', val: counts.total_out ?? 0, icon: ArrowUpRight, cls: 'text-warning', bg: 'bg-warning-dim' },
-    { label: '窗口', val: (counts.window_in ?? 0) + (counts.window_out ?? 0), icon: Activity, cls: 'text-accent', bg: 'bg-accent-dim' },
-    { label: '告警', val: counts.alert_count ?? 0, icon: AlertTriangle, cls: 'text-danger', bg: 'bg-danger-dim' },
+    { label: '今日进入', val: (counts.today_in as number) ?? 0, icon: ArrowDownLeft, cls: 'text-success', bg: 'bg-success-dim' },
+    { label: '今日离开', val: (counts.today_out as number) ?? 0, icon: ArrowUpRight, cls: 'text-warning', bg: 'bg-warning-dim' },
+    { label: '区域人数', val: area.person ?? 0, icon: Users, cls: 'text-info', bg: 'bg-info-dim' },
+    { label: '区域车辆', val: (area.car ?? 0) + (area.truck ?? 0) + (area.bus ?? 0), icon: Car, cls: 'text-accent', bg: 'bg-accent-dim' },
+    { label: '告警', val: (counts.alert_count as number) ?? 0, icon: AlertTriangle, cls: 'text-danger', bg: 'bg-danger-dim' },
   ]
 
   return (
@@ -111,7 +114,7 @@ export function LivePage() {
               <div className="absolute inset-x-0 bottom-0 h-20 bg-gradient-to-t from-bg/60 to-transparent pointer-events-none" />
             </div>
 
-            <div className="grid grid-cols-4 gap-3">
+            <div className="grid grid-cols-5 gap-3">
               {stats.map(({ label, val, icon: Icon, cls, bg }) => (
                 <div key={label} className="bg-card rounded-xl p-3 border border-border hover:border-border-light transition-colors cursor-default">
                   <div className="flex items-center justify-between">

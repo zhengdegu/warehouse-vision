@@ -39,7 +39,7 @@ def main():
     print("按 'q' 退出...")
     try:
         while True:
-            frame = reader.read_latest()
+            frame, _ = reader.read_latest()
             if frame is not None:
                 cv2.imshow(f"Camera: {cam['id']}", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):

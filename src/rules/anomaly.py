@@ -1,13 +1,15 @@
 """
 行为异常检测模块（规则型）
-实现：dwell（滞留）、crowd（聚集）、proximity（人车过近）
-预留：wrong_way（逆行）、speed（超速）扩展接口
-所有规则均支持 confirm_frames + cooldown 防抖。
+实现：dwell（滞留/徘徊）、crowd（聚集）、proximity（人车过近）、
+      fight（打架）、fall（跌倒）
+扩展：wrong_way（逆行）、speed（超速）
+所有规则均支持 confirm_frames + cooldown 防抖 + 时间周期约束。
 """
 
 import time
 import math
 import logging
+from datetime import datetime
 from typing import List, Dict, Any, Optional
 from collections import defaultdict
 from ..vision.detector import Detection
@@ -27,9 +29,11 @@ class BaseAnomalyRule:
         self._confirm_count: Dict[str, int] = {}
         self._last_trigger: Dict[str, float] = {}
 
-    def _check_confirm_and_cooldown(self, key: str, condition: bool) -> bool:
+    def _check_confirm_and_cooldown(self, key: str, condition: bool,
+                                     now: float = 0.0) -> bool:
         """通用的确认帧 + 冷却检查"""
-        now = time.time()
+        if now <= 0:
+            now = time.time()
         if condition:
             self._confirm_count[key] = self._confirm_count.get(key, 0) + 1
         else:
@@ -47,7 +51,8 @@ class BaseAnomalyRule:
         return True
 
     def update(self, detections: List[Detection],
-               camera_id: str = "") -> List[Dict[str, Any]]:
+               camera_id: str = "",
+               frame_ts: float = 0.0) -> List[Dict[str, Any]]:
         raise NotImplementedError
 
 
@@ -62,9 +67,10 @@ class DwellRule(BaseAnomalyRule):
         self._first_seen: Dict[int, float] = {}
 
     def update(self, detections: List[Detection],
-               camera_id: str = "") -> List[Dict[str, Any]]:
+               camera_id: str = "",
+               frame_ts: float = 0.0) -> List[Dict[str, Any]]:
         events = []
-        now = time.time()
+        now = frame_ts if frame_ts > 0 else time.time()
         active_ids = set()
 
         for det in detections:
@@ -79,7 +85,7 @@ class DwellRule(BaseAnomalyRule):
             is_dwelling = dwell_time >= self.max_seconds
 
             key = f"dwell_{det.track_id}"
-            if self._check_confirm_and_cooldown(key, is_dwelling):
+            if self._check_confirm_and_cooldown(key, is_dwelling, now=now):
                 events.append({
                     "type": "anomaly",
                     "sub_type": "dwell",
@@ -111,9 +117,10 @@ class CrowdRule(BaseAnomalyRule):
         self.radius = radius
 
     def update(self, detections: List[Detection],
-               camera_id: str = "") -> List[Dict[str, Any]]:
+               camera_id: str = "",
+               frame_ts: float = 0.0) -> List[Dict[str, Any]]:
         events = []
-        now = time.time()
+        now = frame_ts if frame_ts > 0 else time.time()
 
         # 计算所有人的聚集情况
         person_dets = [d for d in detections
@@ -137,7 +144,7 @@ class CrowdRule(BaseAnomalyRule):
             is_crowded = nearby > self.max_count
             key = f"crowd_{det_i.track_id}"
 
-            if self._check_confirm_and_cooldown(key, is_crowded):
+            if self._check_confirm_and_cooldown(key, is_crowded, now=now):
                 events.append({
                     "type": "anomaly",
                     "sub_type": "crowd",
@@ -163,9 +170,10 @@ class ProximityRule(BaseAnomalyRule):
         self._vehicle_classes = {"car", "truck", "bus", "motorcycle", "bicycle"}
 
     def update(self, detections: List[Detection],
-               camera_id: str = "") -> List[Dict[str, Any]]:
+               camera_id: str = "",
+               frame_ts: float = 0.0) -> List[Dict[str, Any]]:
         events = []
-        now = time.time()
+        now = frame_ts if frame_ts > 0 else time.time()
 
         persons = [d for d in detections
                    if d.track_id >= 0 and d.class_name in self._person_classes]
@@ -178,7 +186,7 @@ class ProximityRule(BaseAnomalyRule):
                 is_close = dist < self.min_distance
 
                 key = f"prox_{p.track_id}_{v.track_id}"
-                if self._check_confirm_and_cooldown(key, is_close):
+                if self._check_confirm_and_cooldown(key, is_close, now=now):
                     events.append({
                         "type": "anomaly",
                         "sub_type": "proximity",
@@ -206,11 +214,12 @@ class WrongWayRule(BaseAnomalyRule):
         self._prev_positions: Dict[int, tuple] = {}
 
     def update(self, detections: List[Detection],
-               camera_id: str = "") -> List[Dict[str, Any]]:
+               camera_id: str = "",
+               frame_ts: float = 0.0) -> List[Dict[str, Any]]:
         # 扩展接口：根据预期方向判断是否逆行
         # 需要配合具体场景的方向定义
         events = []
-        now = time.time()
+        now = frame_ts if frame_ts > 0 else time.time()
 
         for det in detections:
             if det.track_id < 0:
@@ -229,7 +238,7 @@ class WrongWayRule(BaseAnomalyRule):
                 is_wrong = dx > 5
 
             key = f"wrongway_{det.track_id}"
-            if self._check_confirm_and_cooldown(key, is_wrong):
+            if self._check_confirm_and_cooldown(key, is_wrong, now=now):
                 events.append({
                     "type": "anomaly",
                     "sub_type": "wrong_way",
@@ -254,9 +263,10 @@ class SpeedRule(BaseAnomalyRule):
         self._prev_times: Dict[int, float] = {}
 
     def update(self, detections: List[Detection],
-               camera_id: str = "") -> List[Dict[str, Any]]:
+               camera_id: str = "",
+               frame_ts: float = 0.0) -> List[Dict[str, Any]]:
         events = []
-        now = time.time()
+        now = frame_ts if frame_ts > 0 else time.time()
 
         for det in detections:
             if det.track_id < 0:
@@ -279,7 +289,7 @@ class SpeedRule(BaseAnomalyRule):
 
             is_fast = speed > self.max_pixel_speed
             key = f"speed_{det.track_id}"
-            if self._check_confirm_and_cooldown(key, is_fast):
+            if self._check_confirm_and_cooldown(key, is_fast, now=now):
                 events.append({
                     "type": "anomaly",
                     "sub_type": "speed",
@@ -351,9 +361,10 @@ class FightRule(BaseAnomalyRule):
         return max_speed
 
     def update(self, detections: List['Detection'],
-               camera_id: str = "") -> List[Dict[str, Any]]:
+               camera_id: str = "",
+               frame_ts: float = 0.0) -> List[Dict[str, Any]]:
         events = []
-        now = time.time()
+        now = frame_ts if frame_ts > 0 else time.time()
 
         person_dets = [d for d in detections
                        if d.track_id >= 0 and d.class_name == "person"]
@@ -408,7 +419,7 @@ class FightRule(BaseAnomalyRule):
             is_fight = len(nearby_fast) >= (self.min_persons - 1) and effective_speed_i > self.min_speed
             key = f"fight_{det_i.track_id}"
 
-            if self._check_confirm_and_cooldown(key, is_fight):
+            if self._check_confirm_and_cooldown(key, is_fight, now=now):
                 involved = [det_i.track_id] + nearby_fast
                 avg_speed = sum(speeds.get(t, 0) for t in involved) / len(involved)
                 has_pose = any(limb_speeds.get(t, 0) > 0 for t in involved)
@@ -503,9 +514,10 @@ class FallRule(BaseAnomalyRule):
         return False
 
     def update(self, detections: List['Detection'],
-               camera_id: str = "") -> List[Dict[str, Any]]:
+               camera_id: str = "",
+               frame_ts: float = 0.0) -> List[Dict[str, Any]]:
         events = []
-        now = time.time()
+        now = frame_ts if frame_ts > 0 else time.time()
 
         person_dets = [d for d in detections
                        if d.track_id >= 0 and d.class_name == "person"]
@@ -550,7 +562,7 @@ class FallRule(BaseAnomalyRule):
                 continue
 
             key = f"fall_{det.track_id}"
-            if self._check_confirm_and_cooldown(key, is_fall):
+            if self._check_confirm_and_cooldown(key, is_fall, now=now):
                 events.append({
                     "type": "anomaly",
                     "sub_type": "fall",
@@ -568,12 +580,19 @@ class FallRule(BaseAnomalyRule):
 
 
 class AnomalyEngine:
-    """异常检测引擎，聚合所有规则"""
+    """异常检测引擎，聚合所有规则，支持时间周期约束"""
 
     def __init__(self, config: dict, roi: Polygon = None):
         self.rules: List[BaseAnomalyRule] = []
         # ROI 多边形，设置后只检测区域内的目标
         self.roi = [(float(p[0]), float(p[1])) for p in roi] if roi else None
+
+        # 时间周期约束
+        tp_cfg = config.get("time_period", {})
+        self._time_period_enabled = tp_cfg.get("enabled", False)
+        self._time_period_start = tp_cfg.get("start", "00:00")
+        self._time_period_end = tp_cfg.get("end", "23:59")
+        self._time_period_days = tp_cfg.get("days", [0, 1, 2, 3, 4, 5, 6])
 
         # dwell
         dwell_cfg = config.get("dwell", {})
@@ -643,9 +662,36 @@ class AnomalyEngine:
                 cooldown=fall_cfg.get("cooldown", 30),
             ))
 
+    def _is_in_active_period(self) -> bool:
+        """检查当前时间是否在激活时段内"""
+        if not self._time_period_enabled:
+            return True  # 未启用时间约束 → 全天候运行
+
+        now = datetime.now()
+        # 检查星期几（0=周一 ... 6=周日）
+        if now.weekday() not in self._time_period_days:
+            return False
+
+        # 检查时间段
+        current = now.strftime("%H:%M")
+        start = self._time_period_start
+        end = self._time_period_end
+
+        if start <= end:
+            # 正常时段，如 08:00 ~ 18:00
+            return start <= current <= end
+        else:
+            # 跨午夜时段，如 22:00 ~ 06:00
+            return current >= start or current <= end
+
     def update(self, detections: List[Detection],
-               camera_id: str = "") -> List[Dict[str, Any]]:
-        """运行所有规则，返回异常事件列表（仅处理 ROI 内的目标）"""
+               camera_id: str = "",
+               frame_ts: float = 0.0) -> List[Dict[str, Any]]:
+        """运行所有规则，返回异常事件列表（仅处理 ROI 内的目标，受时间约束）"""
+        # 时间周期约束检查
+        if not self._is_in_active_period():
+            return []
+
         # ROI 过滤
         if self.roi:
             detections = [d for d in detections
@@ -653,7 +699,8 @@ class AnomalyEngine:
         all_events = []
         for rule in self.rules:
             try:
-                events = rule.update(detections, camera_id)
+                events = rule.update(detections, camera_id,
+                                     frame_ts=frame_ts)
                 all_events.extend(events)
             except Exception as e:
                 logger.error(f"规则 {rule.rule_name} 异常: {e}")

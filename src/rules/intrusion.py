@@ -34,12 +34,13 @@ class IntrusionDetector:
         self._last_trigger: Dict[int, float] = {}
 
     def update(self, detections: List[Detection],
-               camera_id: str = "") -> List[Dict[str, Any]]:
+               camera_id: str = "", frame_ts: float = 0.0) -> List[Dict[str, Any]]:
         """
         更新检测结果，返回入侵事件列表。
+        frame_ts: 帧捕获时间戳，0 则回退到系统时间
         """
         events = []
-        now = time.time()
+        now = frame_ts if frame_ts > 0 else time.time()
         active_ids = set()
 
         for det in detections:

@@ -23,11 +23,14 @@ from .config.schema import AppConfig, CameraConfig
 from .ingest.rtsp_reader import RTSPReader
 from .vision.detector import YOLODetector, Detection, PoseDetector
 from .vision.motion import MotionDetector
+from .vision.inference_queue import InferenceQueue
+from .vision.stationary import StationaryTracker
 from .rules.intrusion import IntrusionDetector
 from .rules.tripwire import TripwireDetector
 from .rules.counting import FlowCounter
 from .rules.anomaly import AnomalyEngine
 from .rules.presence import PresenceDetector
+from .rules.area_counter import AreaCounter
 from .events.evidence import EvidenceSaver, draw_overlay
 from .events.logger import JSONLLogger
 from .events.database import EventDatabase
@@ -42,12 +45,14 @@ class SharedState:
     def __init__(self):
         self.latest_frame_cache: Dict[str, np.ndarray] = {}
         self.count_cache: Dict[str, Dict[str, Any]] = {}
+        self.area_count_cache: Dict[str, Dict[str, Any]] = {}  # 区域内目标计数
         self.event_queue: Queue = Queue(maxsize=1000)
         self.cameras: List[Dict[str, Any]] = []
         # 系统性能指标
         self.perf_stats: Dict[str, Dict[str, Any]] = {}
         self._frame_lock = threading.Lock()
         self._count_lock = threading.Lock()
+        self._area_count_lock = threading.Lock()
         self._perf_lock = threading.Lock()
 
     def update_frame(self, camera_id: str, frame: np.ndarray):
@@ -65,6 +70,16 @@ class SharedState:
     def get_counts(self) -> Dict[str, Dict[str, Any]]:
         with self._count_lock:
             return dict(self.count_cache)
+
+    def update_area_counts(self, camera_id: str, counts: Dict[str, Any]):
+        """更新区域内目标计数"""
+        with self._area_count_lock:
+            self.area_count_cache[camera_id] = counts
+
+    def get_area_counts(self) -> Dict[str, Dict[str, Any]]:
+        """获取所有摄像头的区域内目标计数"""
+        with self._area_count_lock:
+            return dict(self.area_count_cache)
 
     def update_perf(self, camera_id: str, stats: Dict[str, Any]):
         with self._perf_lock:
@@ -96,7 +111,8 @@ class CameraAnalyzer:
                  jsonl_logger: JSONLLogger, event_db: EventDatabase,
                  es_store: ESEventStore = None,
                  detector: YOLODetector = None,
-                 pose_detector: PoseDetector = None):
+                 pose_detector: PoseDetector = None,
+                 inference_queue: InferenceQueue = None):
         self.cam_id = cam_config["id"]
         self.cam_config = cam_config
         self.shared = shared
@@ -125,11 +141,13 @@ class CameraAnalyzer:
         self._last_analyze_time = 0.0
 
         # RTSP 拉流（width/height 传 0 则自动探测）
+        # time_offset: 摄像头时间偏移（秒），None=自动探测，0=不修正
         self.reader = RTSPReader(
             url=cam_config["url"],
             width=cam_config.get("width", 0),
             height=cam_config.get("height", 0),
             fps=cam_config.get("fps", 15),
+            time_offset=cam_config.get("time_offset"),
         )
 
         # 运动检测器 — Frigate 核心优化
@@ -214,6 +232,9 @@ class CameraAnalyzer:
             roi=roi,
         )
 
+        # 区域内目标计数
+        self.area_counter = AreaCounter(roi=roi)
+
         # 截图保存
         self.evidence_saver = EvidenceSaver(
             output_dir=events_config.get("output_dir", "events"),
@@ -229,7 +250,75 @@ class CameraAnalyzer:
         # 支持格式: "tripwire", "intrusion", "presence", "anomaly/dwell" 等
         self._alert_types: list = rules_cfg.get("alert_types", [])
 
+        # 推理队列（所有摄像头共享，串行推理）
+        self._inference_queue = inference_queue
 
+        # 静止目标跟踪器（每路摄像头独立）
+        stationary_cfg = cam_config.get("stationary", {})
+        self._stationary_tracker = StationaryTracker(
+            move_threshold=stationary_cfg.get("move_threshold", 20.0),
+            stationary_frames=stationary_cfg.get("stationary_frames", 15),
+            recheck_interval=stationary_cfg.get("recheck_interval", 30),
+        )
+
+        # 区域裁剪送检配置
+        self._crop_margin = cam_config.get("crop_margin", 50)  # 裁剪区域外扩像素
+
+
+
+    def _crop_motion_region(self, frame: np.ndarray,
+                            motion_boxes) -> tuple:
+        """
+        区域裁剪送检：合并所有运动框为一个大区域，裁剪后返回。
+        如果运动区域覆盖大部分画面（>60%），直接返回原帧。
+
+        返回: (cropped_frame, (offset_x, offset_y)) 或 (original_frame, (0, 0))
+        """
+        h, w = frame.shape[:2]
+
+        if not motion_boxes:
+            return frame, (0, 0)
+
+        # 合并所有运动框为一个包围框
+        x1 = min(mb.x1 for mb in motion_boxes)
+        y1 = min(mb.y1 for mb in motion_boxes)
+        x2 = max(mb.x2 for mb in motion_boxes)
+        y2 = max(mb.y2 for mb in motion_boxes)
+
+        # 外扩 margin
+        margin = self._crop_margin
+        x1 = max(0, x1 - margin)
+        y1 = max(0, y1 - margin)
+        x2 = min(w, x2 + margin)
+        y2 = min(h, y2 + margin)
+
+        crop_w = x2 - x1
+        crop_h = y2 - y1
+
+        # 如果裁剪区域 > 60% 原帧面积，不裁剪（收益太小）
+        if (crop_w * crop_h) > (w * h * 0.6):
+            return frame, (0, 0)
+
+        cropped = frame[y1:y2, x1:x2]
+        return cropped, (x1, y1)
+
+    @staticmethod
+    def _remap_detections(detections, offset: tuple):
+        """将裁剪区域内的检测坐标映射回原始帧坐标"""
+        ox, oy = offset
+        if ox == 0 and oy == 0:
+            return detections
+
+        for det in detections:
+            det.bbox[0] += ox
+            det.bbox[1] += oy
+            det.bbox[2] += ox
+            det.bbox[3] += oy
+            cx, cy = det.center
+            det.center = (cx + ox, cy + oy)
+            fx, fy = det.foot
+            det.foot = (fx + ox, fy + oy)
+        return detections
 
     def _should_alert(self, evt: dict) -> bool:
         """
@@ -271,6 +360,8 @@ class CameraAnalyzer:
             "skip_rate": round(skip_rate, 1),
             "frames_processed": self._frame_count,
             "detections_run": self._detect_count,
+            "stationary_objects": self._stationary_tracker.stationary_count,
+            "tracked_objects": self._stationary_tracker.tracked_count,
         })
 
         self._frame_count = 0
@@ -282,17 +373,21 @@ class CameraAnalyzer:
         """分析主循环 — 带运动预过滤 + 帧率节流 + 崩溃自恢复"""
         logger.info(f"[{self.cam_id}] 分析管线启动 (目标分析帧率: {self._target_analyze_fps} fps)")
         no_frame_count = 0
+        # ffmpeg 连接 RTSP 需要时间，启动/重启后给 30 秒宽限期
+        warmup_until = time.time() + 30.0
 
         while self._running:
             try:
-                frame = self.reader.read_latest()
+                frame, frame_ts = self.reader.read_latest()
                 if frame is None:
                     no_frame_count += 1
                     # 长时间无帧 → 拉流可能挂了，触发 reader 重启
-                    if no_frame_count > 300:  # ~3s at 0.01s sleep
+                    # 宽限期内不重启，避免 ffmpeg 还没连上就被杀掉
+                    if no_frame_count > 300 and time.time() > warmup_until:
                         logger.warning(f"[{self.cam_id}] 长时间无帧，重启拉流")
                         self._restart_reader()
                         no_frame_count = 0
+                        warmup_until = time.time() + 30.0
                     time.sleep(0.01)
                     continue
 
@@ -315,23 +410,64 @@ class CameraAnalyzer:
 
                 if not has_motion:
                     self._skip_count += 1
+                    # 即使无运动，也要更新静止目标的 recheck 计数
+                    self._stationary_tracker.update([])
                     self.shared.update_frame(self.cam_id, frame)
                     self._update_perf_stats()
                     continue
 
-                # ② 目标检测 + 跟踪（仅在有运动时执行）
-                self._detect_count += 1
-                try:
-                    detections = self.detector.track(frame)
-                except Exception as det_err:
-                    logger.error(f"[{self.cam_id}] 检测异常: {det_err}",
-                                 exc_info=True)
-                    detections = []
+                # ② 静止目标过滤 — 复用未移动目标的检测结果
+                stationary_dets, need_detect = \
+                    self._stationary_tracker.get_stationary_detections(motion_boxes)
 
-                # ②-b Pose 检测（可选，为打架/跌倒提供关键点）
+                if not need_detect and stationary_dets:
+                    # 所有目标都是静止的，跳过推理
+                    self._skip_count += 1
+                    detections = stationary_dets
+                else:
+                    # ③ 目标检测 + 跟踪
+                    self._detect_count += 1
+
+                    # 区域裁剪送检：将运动区域合并为一个大区域，裁剪后送检
+                    # 注意：ByteTrack 需要一致的帧输入来维护跟踪状态，
+                    # 所以我们裁剪后在裁剪区域上运行 track()，再映射回原坐标
+                    crop_frame, crop_offset = self._crop_motion_region(
+                        frame, motion_boxes)
+
+                    try:
+                        if self._inference_queue:
+                            raw_dets = self._inference_queue.submit(
+                                crop_frame, self.cam_id, "track")
+                        else:
+                            raw_dets = self.detector.track(crop_frame)
+
+                        # 将裁剪坐标映射回原始帧坐标
+                        detections = self._remap_detections(
+                            raw_dets, crop_offset)
+                    except Exception as det_err:
+                        logger.error(f"[{self.cam_id}] 检测异常: {det_err}",
+                                     exc_info=True)
+                        detections = []
+
+                    # 合并静止目标（它们跳过了本次推理）
+                    if stationary_dets:
+                        detected_ids = {d.track_id for d in detections
+                                        if d.track_id >= 0}
+                        for sd in stationary_dets:
+                            if sd.track_id not in detected_ids:
+                                detections.append(sd)
+
+                # 更新静止目标跟踪器
+                self._stationary_tracker.update(detections)
+
+                # ③-b Pose 检测（可选，为打架/跌倒提供关键点）
                 if self.pose_detector and detections:
                     try:
-                        pose_dets = self.pose_detector.track(frame)
+                        if self._inference_queue:
+                            pose_dets = self._inference_queue.submit(
+                                frame, self.cam_id, "pose_track")
+                        else:
+                            pose_dets = self.pose_detector.track(frame)
                         pose_map = {d.track_id: d.keypoints
                                     for d in pose_dets
                                     if d.track_id >= 0 and d.keypoints is not None}
@@ -348,12 +484,13 @@ class CameraAnalyzer:
                 # ③ 规则引擎
                 if self.intrusion_detector:
                     events = self.intrusion_detector.update(
-                        detections, self.cam_id)
+                        detections, self.cam_id, frame_ts=frame_ts)
                     all_events.extend(events)
 
                 tw_events = []
                 for tw_det in self.tripwire_detectors:
-                    events = tw_det.update(detections, self.cam_id)
+                    events = tw_det.update(detections, self.cam_id,
+                                           frame_ts=frame_ts)
                     tw_events.extend(events)
                 all_events.extend(tw_events)
 
@@ -371,12 +508,22 @@ class CameraAnalyzer:
                             self.cam_id, counts["total_in"], counts["total_out"])
 
                 anomaly_events = self.anomaly_engine.update(
-                    detections, self.cam_id)
+                    detections, self.cam_id, frame_ts=frame_ts)
                 all_events.extend(anomaly_events)
 
                 presence_events = self.presence_detector.update(
-                    detections, self.cam_id)
+                    detections, self.cam_id, frame_ts=frame_ts)
                 all_events.extend(presence_events)
+
+                # 更新区域内目标计数
+                self.area_counter.update(detections)
+                area_counts = self.area_counter.get_counts()
+                self.shared.update_area_counts(self.cam_id, area_counts)
+                
+                # 定期记录区域计数到数据库
+                area_record = self.area_counter.maybe_record(self.cam_id)
+                if area_record:
+                    self.event_db.insert_area_count(area_record)
 
                 # ④ 事件处理（区分记录 vs 告警）
                 for evt in all_events:
@@ -525,6 +672,13 @@ class Application:
                 confidence=pose_config.get("confidence", 0.3),
             )
 
+        # 推理队列 — 所有摄像头共享，串行推理避免 CPU 争抢
+        self._inference_queue = InferenceQueue(
+            detector=self._shared_detector,
+            pose_detector=self._shared_pose_detector,
+            max_queue_size=len(cameras) * 2 + 4,
+        )
+
         for cam_cfg in cameras:
             analyzer = CameraAnalyzer(
                 cam_config=cam_cfg,
@@ -536,6 +690,7 @@ class Application:
                 es_store=self.es_store,
                 detector=self._shared_detector,
                 pose_detector=self._shared_pose_detector,
+                inference_queue=self._inference_queue,
             )
             self.analyzers[cam_cfg["id"]] = analyzer
 
@@ -562,6 +717,7 @@ class Application:
                 es_store=self.es_store,
                 detector=self._shared_detector,
                 pose_detector=self._shared_pose_detector,
+                inference_queue=self._inference_queue,
             )
             self.analyzers[cam_id] = analyzer
             analyzer.start()
@@ -607,6 +763,8 @@ class Application:
 
     def start(self):
         logger.info(f"启动 {len(self.analyzers)} 路摄像头分析管线")
+        # 先启动推理队列
+        self._inference_queue.start()
         for analyzer in self.analyzers.values():
             analyzer.start()
         # 同步摄像头配置到 ES
@@ -723,6 +881,8 @@ class Application:
 
         with self._lock:
             self._shared_detector = new_detector
+            # 更新推理队列中的检测器
+            self._inference_queue.detector = new_detector
             for cam_id, analyzer in self.analyzers.items():
                 analyzer.detector = new_detector
                 logger.info(f"[{cam_id}] 检测器已替换为新模型: {new_model_path}")
@@ -739,4 +899,5 @@ class Application:
         self._watchdog_running = False
         for analyzer in self.analyzers.values():
             analyzer.stop()
+        self._inference_queue.stop()
         logger.info("所有分析管线已停止")

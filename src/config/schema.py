@@ -82,10 +82,43 @@ class ProximityConfig(BaseModel):
     confirm_frames: int = 3
     cooldown: float = 30
 
+class FightConfig(BaseModel):
+    enabled: bool = False
+    proximity_radius: float = 150
+    min_speed: float = 60
+    min_persons: int = 2
+    confirm_frames: int = 3
+    cooldown: float = 30
+
+class FallConfig(BaseModel):
+    enabled: bool = False
+    ratio_threshold: float = 1.0
+    min_ratio_change: float = 0.5
+    min_y_drop: float = 20
+    confirm_frames: int = 2
+    cooldown: float = 30
+
+
+# ── 时间周期约束 ─────────────────────────────────────────────────────────
+
+class TimePeriodConfig(BaseModel):
+    """时间周期约束：仅在指定时段内启用规则"""
+    enabled: bool = Field(False, description="是否启用时间约束，False=全天候运行")
+    start: str = Field("00:00", description="开始时间 HH:MM")
+    end: str = Field("23:59", description="结束时间 HH:MM")
+    days: List[int] = Field(
+        default_factory=lambda: [0, 1, 2, 3, 4, 5, 6],
+        description="生效的星期几，0=周一 ... 6=周日"
+    )
+
+
 class AnomalyRuleConfig(BaseModel):
     dwell: DwellConfig = DwellConfig()
     crowd: CrowdConfig = CrowdConfig()
     proximity: ProximityConfig = ProximityConfig()
+    fight: FightConfig = FightConfig()
+    fall: FallConfig = FallConfig()
+    time_period: TimePeriodConfig = TimePeriodConfig()
 
 class RulesConfig(BaseModel):
     intrusion: IntrusionRuleConfig = IntrusionRuleConfig()
@@ -95,7 +128,8 @@ class RulesConfig(BaseModel):
     alert_types: List[str] = Field(
         default_factory=list,
         description="触发告警的事件类型列表，空=全部告警。"
-                    "可选值: intrusion, tripwire, presence, anomaly/dwell, anomaly/crowd, anomaly/proximity"
+                    "可选值: intrusion, tripwire, presence, anomaly/dwell, anomaly/crowd, "
+                    "anomaly/proximity, anomaly/fight, anomaly/fall"
     )
 
 

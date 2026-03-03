@@ -166,9 +166,10 @@ class TripwireDetector:
         return self._crossing_to_dir(crossing)
 
     def update(self, detections: List[Detection],
-               camera_id: str = "") -> List[Dict[str, Any]]:
+               camera_id: str = "",
+               frame_ts: float = 0.0) -> List[Dict[str, Any]]:
         events = []
-        now = time.time()
+        now = frame_ts if frame_ts > 0 else time.time()
         self._cleanup_stale(now)
 
         # 调试日志
