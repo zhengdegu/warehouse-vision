@@ -5,8 +5,7 @@ services:
     build: .
     container_name: warehouse-vision
     restart: unless-stopped
-    ports:
-      - "8000:8000"
+    network_mode: host
     volumes:
       - ./configs:/app/configs
       - ./data:/app/data
@@ -14,6 +13,7 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - TZ=Asia/Shanghai
     # GPU 支持（需要 nvidia-container-toolkit）
     deploy:
       resources:

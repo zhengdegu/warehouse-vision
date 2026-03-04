@@ -12,7 +12,7 @@ interface Props {
 }
 
 const defaultForm = {
-  id: '', name: '', url: '', width: 1280, height: 720, fps: 15,
+  id: '', name: '', url: '', rtsp_url: '', width: 1280, height: 720, fps: 15,
   roi: [] as number[][],
   tripwires: [] as Tripwire[],
   motion: {
@@ -137,7 +137,7 @@ export function CameraModal({ mode, camId, onClose, onSaved }: Props) {
               <Field label="摄像头 ID" value={form.id} onChange={v => set('id', v)} disabled={mode === 'edit'} />
               <Field label="名称" value={form.name} onChange={v => set('name', v)} />
               <div className="col-span-2">
-                <Field label="RTSP 地址" value={form.url} onChange={v => set('url', v)} />
+                <Field label="RTSP 原始地址" value={form.rtsp_url} onChange={v => set('rtsp_url', v)} />
               </div>
               <Field label="宽度" value={form.width} onChange={v => set('width', Number(v))} type="number" />
               <Field label="高度" value={form.height} onChange={v => set('height', Number(v))} type="number" />

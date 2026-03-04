@@ -188,3 +188,140 @@ class PoseDetector:
                 ))
 
         return detections
+
+class RoboflowDetector:
+    """
+    Roboflow RF-DETR 检测器 + supervision ByteTrack 跟踪。
+    与 YOLODetector 接口一致（detect/track），可无缝替换。
+
+    参数:
+        model_id: RF-DETR 模型标识，可选:
+            "rfdetr-base", "rfdetr-large", "rfdetr-nano",
+            "rfdetr-small", "rfdetr-medium", "rfdetr-seg-preview"
+        confidence: 置信度阈值
+        allowed_classes: 类别名称白名单（如 ["person", "car"]），None=全部
+    """
+
+    # 延迟导入的模型映射
+    _MODEL_REGISTRY = None
+
+    @classmethod
+    def _get_model_registry(cls):
+        if cls._MODEL_REGISTRY is None:
+            from rfdetr import RFDETRBase, RFDETRLarge
+            try:
+                from rfdetr import RFDETRNano, RFDETRSmall, RFDETRMedium
+            except ImportError:
+                RFDETRNano = RFDETRSmall = RFDETRMedium = None
+            try:
+                from rfdetr import RFDETRSegPreview
+            except ImportError:
+                RFDETRSegPreview = None
+
+            registry = {
+                "rfdetr-base": RFDETRBase,
+                "rfdetr-large": RFDETRLarge,
+            }
+            if RFDETRNano:
+                registry["rfdetr-nano"] = RFDETRNano
+            if RFDETRSmall:
+                registry["rfdetr-small"] = RFDETRSmall
+            if RFDETRMedium:
+                registry["rfdetr-medium"] = RFDETRMedium
+            if RFDETRSegPreview:
+                registry["rfdetr-seg-preview"] = RFDETRSegPreview
+            cls._MODEL_REGISTRY = registry
+        return cls._MODEL_REGISTRY
+
+    def __init__(self, model_id: str = "rfdetr-base",
+                 confidence: float = 0.5,
+                 allowed_classes: Optional[List[str]] = None):
+        import supervision as sv
+        import warnings
+
+        registry = self._get_model_registry()
+        if model_id not in registry:
+            raise ValueError(
+                f"未知 model_id: {model_id}，可选: {list(registry.keys())}")
+
+        logger.info(f"加载 Roboflow RF-DETR 模型: {model_id}")
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore")
+            self.model = registry[model_id]()
+            try:
+                self.model.optimize_for_inference()
+            except RuntimeError:
+                self.model.optimize_for_inference(compile=False)
+
+        self.confidence = confidence
+        self.allowed_classes = allowed_classes
+        self.class_names = self.model.class_names  # {id: name}
+
+        # supervision ByteTrack 跟踪器
+        self._tracker = sv.ByteTrack(
+            track_activation_threshold=confidence,
+            minimum_matching_threshold=0.8,
+            frame_rate=30,
+        )
+
+        logger.info(
+            f"Roboflow RF-DETR 已加载: {model_id}, "
+            f"类别白名单: {allowed_classes}")
+
+    def _sv_to_detections(self, sv_dets, with_track: bool = False) -> List[Detection]:
+        """将 supervision.Detections 转换为项目 Detection 列表"""
+        detections = []
+        if sv_dets.class_id is None or not sv_dets.class_id.size:
+            return detections
+
+        for i in range(len(sv_dets)):
+            cls_id = int(sv_dets.class_id[i])
+            cls_name = self.class_names.get(cls_id, str(cls_id))
+
+            # 类别白名单过滤
+            if self.allowed_classes and cls_name not in self.allowed_classes:
+                continue
+
+            conf = float(sv_dets.confidence[i]) if sv_dets.confidence is not None else 0.0
+            x1, y1, x2, y2 = sv_dets.xyxy[i].tolist()
+            cx = (x1 + x2) / 2
+            cy = (y1 + y2) / 2
+
+            track_id = -1
+            if with_track and sv_dets.tracker_id is not None:
+                track_id = int(sv_dets.tracker_id[i])
+
+            detections.append(Detection(
+                track_id=track_id,
+                class_id=cls_id,
+                class_name=cls_name,
+                confidence=conf,
+                bbox=[x1, y1, x2, y2],
+                center=(cx, cy),
+                foot=(cx, y2),
+            ))
+
+        return detections
+
+    def _predict(self, frame: np.ndarray):
+        """运行 RF-DETR 推理，返回 supervision.Detections"""
+        import supervision as sv
+
+        result = self.model.predict(frame, confidence=self.confidence)
+        sv_dets = result[0] if isinstance(result, list) else result
+
+        if sv_dets.class_id is None or not sv_dets.class_id.size:
+            return sv.Detections.empty()
+        return sv_dets
+
+    def detect(self, frame: np.ndarray) -> List[Detection]:
+        """纯检测，不跟踪"""
+        sv_dets = self._predict(frame)
+        return self._sv_to_detections(sv_dets, with_track=False)
+
+    def track(self, frame: np.ndarray) -> List[Detection]:
+        """检测 + ByteTrack 跟踪"""
+        sv_dets = self._predict(frame)
+        tracked = self._tracker.update_with_detections(sv_dets)
+        return self._sv_to_detections(tracked, with_track=True)
+

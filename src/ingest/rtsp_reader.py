@@ -1,32 +1,186 @@
 """
-RTSP 拉流模块
-使用 ffmpeg subprocess 以 TCP 方式拉取 RTSP 流，
-输出 rawvideo bgr24，线程 + Queue(maxsize=1) 仅保留最新帧。
-支持自动重连。
+RTSP 拉流模块 — 严格参考 Frigate 架构
+
+核心设计（对标 Frigate）:
+- ffmpeg subprocess 输出 rawvideo yuv420p 到 stdout pipe
+- 输入预设: preset-rtsp-restream（从 go2rtc 拉流，参数精简）
+- 缩放预设: -r {fps} -vf fps={fps},scale={w}:{h}
+- 输出参数: -threads 2 -f rawvideo -pix_fmt yuv420p pipe:
+- bufsize = frame_size * 10（Frigate start_or_restart_ffmpeg）
+- stderr 通过 LogPipe 线程消费，保留最近 100 行用于调试
+- 看门狗: 1秒轮询，20秒无帧重启，进程崩溃重启
+- 帧队列 maxsize=1，只保留最新帧
+
+参考文件:
+- frigate/frigate/video.py: start_or_restart_ffmpeg, capture_frames, CameraWatchdog
+- frigate/frigate/ffmpeg_presets.py: PRESETS_INPUT, PRESETS_HW_ACCEL_SCALE
+- frigate/frigate/config/camera/ffmpeg.py: DETECT_FFMPEG_OUTPUT_ARGS_DEFAULT
+- frigate/frigate/log.py: LogPipe
 """
 
+import os
 import subprocess
 import threading
 import time
 import logging
 import json
+from collections import deque
+
 import numpy as np
+import cv2
 from queue import Queue, Full
 
 logger = logging.getLogger(__name__)
 
 
+class LogPipe(threading.Thread):
+    """
+    stderr 日志管道 — 参考 Frigate LogPipe。
+    将 ffmpeg stderr 通过 pipe 读取，存入 deque(maxlen=100)，
+    需要时 dump() 输出最近日志用于调试。
+    """
+
+    def __init__(self, name: str, level: int = logging.WARNING):
+        super().__init__(daemon=True)
+        self._logger = logging.getLogger(f"ffmpeg.{name}")
+        self._level = level
+        self.deque: deque = deque(maxlen=100)
+        self._fd_read, self._fd_write = os.pipe()
+        self._reader = os.fdopen(self._fd_read)
+        self.start()
+
+    def fileno(self) -> int:
+        """返回写端 fd，供 subprocess stderr 使用"""
+        return self._fd_write
+
+    def run(self):
+        """读取 stderr 所有行，存入 deque"""
+        try:
+            for line in iter(self._reader.readline, ""):
+                cleaned = line.strip()
+                if cleaned:
+                    self.deque.append(cleaned)
+        except Exception:
+            pass
+        finally:
+            try:
+                self._reader.close()
+            except Exception:
+                pass
+
+    def dump(self):
+        """输出最近的 stderr 日志（重启前调用）"""
+        if self.deque:
+            self._logger.log(
+                self._level,
+                f"最近 {len(self.deque)} 行 ffmpeg 日志:"
+            )
+            while self.deque:
+                self._logger.log(self._level, self.deque.popleft())
+
+    def close(self):
+        """关闭写端 fd"""
+        try:
+            os.close(self._fd_write)
+        except Exception:
+            pass
+
+
+def _stop_ffmpeg(process: subprocess.Popen, log: logging.Logger):
+    """
+    安全终止 ffmpeg 进程 — 参考 Frigate stop_ffmpeg。
+    先 terminate，等 30s，超时则 kill。
+    """
+    if process is None:
+        return
+    log.info("终止 ffmpeg 进程...")
+    try:
+        process.terminate()
+        process.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        log.warning("ffmpeg 未退出，强制 kill")
+        process.kill()
+        process.wait()
+    except Exception:
+        try:
+            process.kill()
+        except Exception:
+            pass
+
+
+def _start_ffmpeg(cmd: list, log: logging.Logger,
+                  logpipe: LogPipe, frame_size: int) -> subprocess.Popen:
+    """
+    启动 ffmpeg 进程 — 参考 Frigate start_or_restart_ffmpeg。
+    stdout=PIPE, stderr=logpipe, bufsize=frame_size*10
+    """
+    log.info(f"启动 ffmpeg: {' '.join(cmd)}")
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=logpipe,
+        stdin=subprocess.DEVNULL,
+        bufsize=frame_size * 10,
+    )
+    return process
+
+
 class RTSPReader:
-    """RTSP 拉流器，基于 ffmpeg subprocess"""
+    """
+    RTSP 拉流器 — 严格参考 Frigate 架构。
+
+    架构对标:
+    - CameraWatchdog.start_ffmpeg_detect() → start()
+    - capture_frames() → _capture_loop()
+    - CameraWatchdog.run() → _watchdog_loop()
+    - CameraWatchdog.reset_capture_thread() → _restart_ffmpeg()
+
+    ffmpeg 命令结构（对标 Frigate）:
+    ffmpeg [global_args] [input_args] -i [url] [scale_args] [output_args] pipe:
+
+    从 go2rtc restream 拉流时使用 preset-rtsp-restream:
+    -rtsp_transport tcp -timeout 10000000
+    """
+
+    # Frigate preset-rtsp-restream 输入参数
+    PRESET_RTSP_RESTREAM = [
+        "-rtsp_transport", "tcp",
+        "-timeout", "10000000",       # 10s RTSP 超时（微秒）
+    ]
+
+    # Frigate preset-rtsp-generic 输入参数（直连摄像头时使用）
+    PRESET_RTSP_GENERIC = [
+        "-avoid_negative_ts", "make_zero",
+        "-fflags", "+genpts+discardcorrupt",
+        "-rtsp_transport", "tcp",
+        "-timeout", "10000000",
+        "-use_wallclock_as_timestamps", "1",
+    ]
+
+    # Frigate DETECT_FFMPEG_OUTPUT_ARGS_DEFAULT
+    DETECT_OUTPUT_ARGS = [
+        "-threads", "2",
+        "-f", "rawvideo",
+        "-pix_fmt", "yuv420p",
+    ]
+
+    # 看门狗参数（对标 Frigate CameraWatchdog）
+    WATCHDOG_INTERVAL = 1.0       # 1秒轮询
+    NO_FRAME_TIMEOUT = 20.0       # 20秒无帧 → 重启
+    FPS_OVERFLOW_THRESHOLD = 3    # FPS 溢出3次 → 重启
 
     def __init__(self, url: str, width: int = 0, height: int = 0,
                  fps: int = 15, reconnect_delay: float = 3.0,
-                 time_offset: float = None):
+                 time_offset: float = None, use_restream: bool = True):
         """
         Args:
-            time_offset: 摄像头时间与本地时间的偏移量（秒），
-                         camera_time = local_time + time_offset。
-                         None 表示启动时自动探测，0 表示不修正。
+            url: RTSP 流地址（通常是 go2rtc restream 地址）
+            width/height: 目标分辨率，0 表示自动探测
+            fps: 目标帧率
+            reconnect_delay: 重连等待时间（Frigate 的 sleeptime）
+            time_offset: 摄像头时间偏移（秒），None=不修正
+            use_restream: True=从 go2rtc 拉流（preset-rtsp-restream），
+                         False=直连摄像头（preset-rtsp-generic）
         """
         self.url = url
         self.width = width
@@ -34,126 +188,216 @@ class RTSPReader:
         self.fps = fps
         self.reconnect_delay = reconnect_delay
         self._time_offset: float = time_offset if time_offset is not None else 0.0
-        self._auto_detect_offset = time_offset is None
+        self._use_restream = use_restream
 
-        self._frame_size = 0  # 启动时根据实际分辨率计算
+        self._frame_size = 0
         self._queue: Queue = Queue(maxsize=1)
         self._running = False
-        self._thread: threading.Thread | None = None
+
+        # Frigate 架构: 独立的 capture 线程 + watchdog 线程
+        self._capture_thread: threading.Thread | None = None
+        self._watchdog_thread: threading.Thread | None = None
         self._process: subprocess.Popen | None = None
+        self._logpipe: LogPipe | None = None
+
+        # 看门狗状态（对标 Frigate CameraWatchdog）
+        self._last_frame_time: float = 0.0  # 最后收帧时间
+        self._camera_fps: float = 0.0       # 当前实际 FPS
+        self._fps_overflow_count: int = 0
 
     def _build_ffmpeg_cmd(self) -> list:
-        """构建 ffmpeg 命令行"""
-        cmd = [
-            "ffmpeg",
-            "-fflags", "+genpts+discardcorrupt+nobuffer",
-            "-rtsp_transport", "tcp",
-            "-timeout", "10000000",        # RTSP 超时 10s（微秒）
-            "-analyzeduration", "10000000", # 探测时间 10s（解决 MPEG4 解析问题）
-            "-probesize", "5000000",        # 探测大小 5MB
-            "-flags", "+low_delay",
-            "-err_detect", "ignore_err",
-            "-i", self.url,
-        ]
-        # 只有指定了分辨率才做缩放
-        if self.width > 0 and self.height > 0:
-            cmd.extend(["-vf", f"scale={self.width}:{self.height},fps={self.fps}"])
+        """
+        构建 ffmpeg 命令 — 严格对标 Frigate _get_ffmpeg_cmd。
+
+        结构: ffmpeg [global] [input_args] -i [url] [scale] [output] pipe:
+
+        scale 预设（default）: -r {fps} -vf fps={fps},scale={w}:{h}
+        output 预设: -threads 2 -f rawvideo -pix_fmt yuv420p
+        """
+        # global args
+        cmd = ["ffmpeg", "-hide_banner"]
+
+        # input args — 根据是否从 go2rtc restream 拉流选择预设
+        if self._use_restream:
+            cmd.extend(self.PRESET_RTSP_RESTREAM)
         else:
-            cmd.extend(["-vf", f"fps={self.fps}"])
-        cmd.extend([
-            "-f", "rawvideo",
-            "-pix_fmt", "bgr24",
-            "-an",              # 不要音频
-            "-sn",              # 不要字幕
-            "-loglevel", "warning",
-            "-"
-        ])
+            cmd.extend(self.PRESET_RTSP_GENERIC)
+
+        # -i url
+        cmd.extend(["-i", self.url])
+
+        # scale args — 对标 Frigate PRESETS_HW_ACCEL_SCALE["default"]
+        # default: "-r {fps} -vf fps={fps},scale={w}:{h}"
+        if self.width > 0 and self.height > 0:
+            cmd.extend([
+                "-r", str(self.fps),
+                "-vf", f"fps={self.fps},scale={self.width}:{self.height}",
+            ])
+        else:
+            cmd.extend(["-r", str(self.fps)])
+
+        # output args — 对标 Frigate DETECT_FFMPEG_OUTPUT_ARGS_DEFAULT
+        cmd.extend(self.DETECT_OUTPUT_ARGS)
+
+        # pipe: — 对标 Frigate ffmpeg_output_args + ["pipe:"]
+        cmd.append("pipe:")
+
         return cmd
 
-    def _drain_stderr(self, proc: subprocess.Popen):
-        """读取 stderr，只打印关键错误信息"""
+    def _capture_loop(self):
+        """
+        帧捕获循环 — 严格对标 Frigate capture_frames()。
+
+        从 ffmpeg stdout 读取固定大小的 YUV420P 帧，
+        转换为 BGR 后推入队列。
+        """
+        frame_size = self._frame_size
+
         try:
-            for line in proc.stderr:
-                if isinstance(line, bytes):
-                    line = line.decode("utf-8", errors="replace")
-                line = line.strip()
-                if not line:
-                    continue
-                # 过滤掉重复的解码警告，只保留关键错误
-                if any(skip in line for skip in [
-                    "Last message repeated",
-                    "VOL Header truncated", 
-                    "PPS id out of range",
-                    "Skipping invalid undecodable NALU",
-                    "Could not find ref with POC",
-                    "deprecated pixel format",
-                ]):
-                    continue
-                logger.warning(f"ffmpeg: {line}")
-        except Exception:
-            pass
+            while self._running and self._process:
+                # 对标 Frigate: frame_buffer[:] = ffmpeg_process.stdout.read(frame_size)
+                raw = self._process.stdout.read(frame_size)
 
-    def _read_loop(self):
-        """拉流主循环，自动重连"""
-        while self._running:
-            try:
-                cmd = self._build_ffmpeg_cmd()
-                logger.info(f"启动 ffmpeg: {' '.join(cmd)}")
-                self._process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    bufsize=self._frame_size * 2
-                )
-
-                # 启动 stderr 消费线程，防止 buffer 满阻塞
-                stderr_thread = threading.Thread(
-                    target=self._drain_stderr,
-                    args=(self._process,),
-                    daemon=True,
-                )
-                stderr_thread.start()
-
-                while self._running:
-                    raw = self._process.stdout.read(self._frame_size)
-                    if len(raw) != self._frame_size:
-                        logger.warning("ffmpeg 输出不完整，准备重连")
+                if len(raw) != frame_size:
+                    # 对标 Frigate: "Unable to read frames from ffmpeg process."
+                    if not self._running:
                         break
 
-                    frame = np.frombuffer(raw, dtype=np.uint8).reshape(
-                        (self.height, self.width, 3)
-                    )
-                    # 使用摄像头时间：本地时间 + 偏移量
-                    capture_ts = time.time() + self._time_offset
+                    if self._process.poll() is not None:
+                        logger.error(
+                            f"ffmpeg 进程已退出 (pid={self._process.pid})，"
+                            f"capture 线程结束"
+                        )
+                        break
 
-                    # Queue(maxsize=1)：丢弃旧帧，只保留最新帧
-                    try:
-                        self._queue.get_nowait()
-                    except Exception:
-                        pass
-                    try:
-                        self._queue.put_nowait((frame, capture_ts))
-                    except Full:
-                        pass
+                    logger.warning("ffmpeg 输出不完整，跳过此帧")
+                    continue
 
-            except Exception as e:
-                logger.error(f"拉流异常: {e}")
-            finally:
-                self._kill_process()
+                # 更新最后收帧时间（看门狗用）
+                self._last_frame_time = time.time()
 
+                # YUV420P → BGR
+                yuv = np.frombuffer(raw, dtype=np.uint8).reshape(
+                    (self.height * 3 // 2, self.width)
+                )
+                frame = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
+
+                # 推入队列（丢弃旧帧，只保留最新帧）
+                capture_ts = time.time() + self._time_offset
+                try:
+                    self._queue.get_nowait()
+                except Exception:
+                    pass
+                try:
+                    self._queue.put_nowait((frame, capture_ts))
+                except Full:
+                    pass
+
+        except Exception as e:
             if self._running:
-                logger.info(f"{self.reconnect_delay}s 后重连...")
-                time.sleep(self.reconnect_delay)
+                logger.error(f"capture 线程异常: {e}")
 
-    def _kill_process(self):
-        """安全终止 ffmpeg 进程"""
-        if self._process:
-            try:
-                self._process.kill()
-                self._process.wait(timeout=5)
-            except Exception:
-                pass
-            self._process = None
+    def _watchdog_loop(self):
+        """
+        看门狗循环 — 严格对标 Frigate CameraWatchdog.run()。
+
+        1秒轮询:
+        - capture 线程崩溃 → 重启 ffmpeg
+        - 20秒无帧 → 重启 ffmpeg
+        - 进程退出 → 重启 ffmpeg
+        """
+        logger.info(f"看门狗已启动: {self.url}")
+
+        # 启动 ffmpeg + capture 线程
+        self._start_ffmpeg()
+        time.sleep(self.reconnect_delay)
+
+        while self._running:
+            time.sleep(self.WATCHDOG_INTERVAL)
+
+            if not self._running:
+                break
+
+            # 检查 capture 线程是否存活
+            # 对标 Frigate: if not self.capture_thread.is_alive()
+            if self._capture_thread is None or not self._capture_thread.is_alive():
+                logger.error("capture 线程已退出，重启 ffmpeg")
+                self._restart_ffmpeg()
+                continue
+
+            # 检查是否超过 20 秒无帧
+            # 对标 Frigate: now - self.capture_thread.current_frame.value > 20
+            now = time.time()
+            if self._last_frame_time > 0 and (now - self._last_frame_time > self.NO_FRAME_TIMEOUT):
+                logger.warning(
+                    f"{self.NO_FRAME_TIMEOUT}秒无帧，重启 ffmpeg"
+                )
+                self._restart_ffmpeg()
+                continue
+
+            # 检查 ffmpeg 进程是否还在运行
+            if self._process is not None and self._process.poll() is not None:
+                logger.error(
+                    f"ffmpeg 进程已退出 (returncode={self._process.returncode})，"
+                    f"重启"
+                )
+                self._restart_ffmpeg()
+                continue
+
+    def _start_ffmpeg(self):
+        """
+        启动 ffmpeg + capture 线程 — 对标 Frigate start_ffmpeg_detect()。
+        """
+        cmd = self._build_ffmpeg_cmd()
+
+        # 创建 LogPipe（对标 Frigate LogPipe）
+        self._logpipe = LogPipe(name=self.url.split("/")[-1])
+
+        # 启动 ffmpeg（对标 Frigate start_or_restart_ffmpeg）
+        self._process = _start_ffmpeg(
+            cmd, logger, self._logpipe, self._frame_size
+        )
+
+        # 重置看门狗状态
+        self._last_frame_time = time.time()  # 给初始宽限
+        self._fps_overflow_count = 0
+
+        # 启动 capture 线程（对标 Frigate CameraCaptureRunner）
+        self._capture_thread = threading.Thread(
+            target=self._capture_loop, daemon=True,
+            name=f"capture-{self.url.split('/')[-1]}"
+        )
+        self._capture_thread.start()
+
+    def _restart_ffmpeg(self):
+        """
+        重启 ffmpeg — 对标 Frigate CameraWatchdog.reset_capture_thread()。
+
+        1. 终止旧 ffmpeg 进程
+        2. 等待 capture 线程退出
+        3. dump stderr 日志
+        4. 重新启动
+        """
+        # 终止 ffmpeg
+        _stop_ffmpeg(self._process, logger)
+        self._process = None
+
+        # 等待 capture 线程退出
+        if self._capture_thread is not None and self._capture_thread.is_alive():
+            self._capture_thread.join(timeout=5)
+
+        # dump 最近的 stderr 日志（对标 Frigate logpipe.dump()）
+        if self._logpipe:
+            logger.error("重启前 ffmpeg 日志:")
+            self._logpipe.dump()
+            self._logpipe.close()
+            self._logpipe = None
+
+        # 等待后重启
+        if self._running:
+            logger.info(f"{self.reconnect_delay}s 后重启 ffmpeg...")
+            time.sleep(self.reconnect_delay)
+            self._start_ffmpeg()
 
     def probe_resolution(self, timeout: float = 15.0) -> tuple:
         """
@@ -184,54 +428,12 @@ class RTSPReader:
             logger.warning(f"ffprobe 探测失败: {e}")
         return 0, 0
 
-    def probe_time_offset(self, timeout: float = 10.0) -> float:
-        """
-        探测摄像头时间与本地时间的偏移量。
-        通过 ffprobe 获取 RTSP 流的 start_time（基于 NTP/RTCP），
-        与本地时间对比得到偏移量。
-        返回偏移量（秒），camera_time = local_time + offset。
-        探测失败返回 0.0。
-        """
-        cmd = [
-            "ffprobe",
-            "-rtsp_transport", "tcp",
-            "-v", "quiet",
-            "-print_format", "json",
-            "-show_format",
-            self.url,
-        ]
-        try:
-            before = time.time()
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=timeout
-            )
-            after = time.time()
-            probe_local_time = (before + after) / 2  # 取探测中间时刻
-
-            info = json.loads(result.stdout)
-            fmt = info.get("format", {})
-            # start_time 是流的起始 PTS（秒），对于 RTSP 通常基于 NTP
-            start_time_str = fmt.get("start_time")
-            if start_time_str:
-                stream_time = float(start_time_str)
-                # 对于某些摄像头，start_time 是 Unix epoch 秒
-                # 如果值很大（>1e9），说明是绝对时间戳
-                if stream_time > 1e9:
-                    offset = stream_time - probe_local_time
-                    logger.info(f"探测到摄像头时间偏移: {offset:+.2f}s "
-                                f"(摄像头={stream_time:.0f}, 本地={probe_local_time:.0f})")
-                    return offset
-            logger.info("未能从流中获取绝对时间戳，使用本地时间（偏移=0）")
-        except Exception as e:
-            logger.warning(f"时间偏移探测失败: {e}")
-        return 0.0
-
     def start(self):
-        """启动拉流线程"""
+        """启动拉流 — 启动看门狗线程（看门狗内部启动 ffmpeg + capture）"""
         if self._running:
             return
 
-        # 如果未指定宽高，自动探测
+        # 自动探测分辨率
         if self.width <= 0 or self.height <= 0:
             pw, ph = self.probe_resolution()
             if pw > 0 and ph > 0:
@@ -243,16 +445,16 @@ class RTSPReader:
                 self.height = self.height or 720
                 logger.warning(f"探测失败，使用默认分辨率: {self.width}x{self.height}")
 
-        # 跳过时间偏移探测（太慢且经常超时），直接使用配置值或默认 0
-        if self._auto_detect_offset:
-            # 不再自动探测，直接用 0
-            self._time_offset = 0.0
-            logger.info(f"使用本地时间（偏移=0）")
-
-        self._frame_size = self.width * self.height * 3
+        # YUV420P: 1.5 bytes/pixel
+        self._frame_size = self.width * self.height * 3 // 2
         self._running = True
-        self._thread = threading.Thread(target=self._read_loop, daemon=True)
-        self._thread.start()
+
+        # 启动看门狗线程（对标 Frigate CameraWatchdog 独立线程）
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog_loop, daemon=True,
+            name=f"watchdog-{self.url.split('/')[-1]}"
+        )
+        self._watchdog_thread.start()
         logger.info(f"RTSPReader 已启动: {self.url} ({self.width}x{self.height})")
 
     def read_latest(self) -> tuple:
@@ -263,9 +465,24 @@ class RTSPReader:
             return None, 0.0
 
     def stop(self):
-        """停止拉流"""
+        """停止拉流 — 对标 Frigate stop_all_ffmpeg"""
         self._running = False
-        self._kill_process()
-        if self._thread:
-            self._thread.join(timeout=5)
+
+        # 终止 ffmpeg
+        _stop_ffmpeg(self._process, logger)
+        self._process = None
+
+        # 等待 capture 线程
+        if self._capture_thread and self._capture_thread.is_alive():
+            self._capture_thread.join(timeout=5)
+
+        # 等待看门狗线程
+        if self._watchdog_thread and self._watchdog_thread.is_alive():
+            self._watchdog_thread.join(timeout=5)
+
+        # 清理 logpipe
+        if self._logpipe:
+            self._logpipe.close()
+            self._logpipe = None
+
         logger.info(f"RTSPReader 已停止: {self.url}")

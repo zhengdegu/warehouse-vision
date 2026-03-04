@@ -21,7 +21,8 @@ import numpy as np
 
 from .config.schema import AppConfig, CameraConfig
 from .ingest.rtsp_reader import RTSPReader
-from .vision.detector import YOLODetector, Detection, PoseDetector
+from .ingest.go2rtc import Go2RTCManager
+from .vision.detector import YOLODetector, Detection, PoseDetector, RoboflowDetector
 from .vision.motion import MotionDetector
 from .vision.inference_queue import InferenceQueue
 from .vision.stationary import StationaryTracker
@@ -373,7 +374,8 @@ class CameraAnalyzer:
         """分析主循环 — 带运动预过滤 + 帧率节流 + 崩溃自恢复"""
         logger.info(f"[{self.cam_id}] 分析管线启动 (目标分析帧率: {self._target_analyze_fps} fps)")
         no_frame_count = 0
-        # ffmpeg 连接 RTSP 需要时间，启动/重启后给 30 秒宽限期
+        # RTSPReader 内部有看门狗（20秒无帧自动重启 ffmpeg），
+        # 这里只需要处理分析层面的长时间无帧（reader 本身可能在重连中）
         warmup_until = time.time() + 30.0
 
         while self._running:
@@ -646,6 +648,14 @@ class Application:
             enabled=es_cfg.get("enabled", False),
         )
 
+        # go2rtc 流管理器
+        go2rtc_cfg = self.config.get("go2rtc", {})
+        self.go2rtc_manager = Go2RTCManager(
+            api_url=go2rtc_cfg.get("api_url", "http://127.0.0.1:1984"),
+            rtsp_port=go2rtc_cfg.get("rtsp_port", 8555),
+            config_path=go2rtc_cfg.get("config_path", "configs/go2rtc.yaml"),
+        )
+
         self.analyzers: Dict[str, CameraAnalyzer] = {}
         self._lock = threading.Lock()
         self._cleanup_thread: Optional[threading.Thread] = None
@@ -655,15 +665,30 @@ class Application:
         cameras = self.config.get("cameras", [])
         self.shared.cameras = cameras
 
+        # 启动时同步：将所有摄像头的 rtsp_url 注册到 go2rtc
+        for cam_cfg in cameras:
+            rtsp_url = cam_cfg.get("rtsp_url", "")
+            if rtsp_url:
+                self.go2rtc_manager.add_stream(cam_cfg["id"], rtsp_url)
+
         model_config = self.config.get("model", {})
         events_config = self.config.get("events", {})
 
         # 共享模型实例 — 所有摄像头复用同一个检测器，避免重复加载
-        self._shared_detector = YOLODetector(
-            model_path=model_config.get("path", "yolo26m.pt"),
-            confidence=model_config.get("confidence", 0.5),
-            allowed_classes=model_config.get("classes"),
-        )
+        detector_type = model_config.get("detector_type", "yolo")
+        if detector_type == "roboflow":
+            rf_cfg = model_config.get("roboflow", {})
+            self._shared_detector = RoboflowDetector(
+                model_id=rf_cfg.get("model_id", "rfdetr-base"),
+                confidence=model_config.get("confidence", 0.5),
+                allowed_classes=rf_cfg.get("classes") or None,
+            )
+        else:
+            self._shared_detector = YOLODetector(
+                model_path=model_config.get("path", "yolo26m.pt"),
+                confidence=model_config.get("confidence", 0.5),
+                allowed_classes=model_config.get("classes"),
+            )
         self._shared_pose_detector = None
         pose_config = model_config.get("pose", {})
         if pose_config.get("enabled", False):
@@ -700,6 +725,13 @@ class Application:
 
     def add_camera(self, cam_cfg: dict):
         cam_id = cam_cfg["id"]
+
+        # go2rtc 自动管理：如果提供了 rtsp_url，注册到 go2rtc 并自动设置 restream url
+        rtsp_url = cam_cfg.get("rtsp_url", "")
+        if rtsp_url:
+            self.go2rtc_manager.add_stream(cam_id, rtsp_url)
+            cam_cfg["url"] = self.go2rtc_manager.get_restream_url(cam_id)
+
         with self._lock:
             if cam_id in self.analyzers:
                 self.analyzers[cam_id].stop()
@@ -741,6 +773,9 @@ class Application:
             if cam_id in self.analyzers:
                 self.analyzers[cam_id].stop()
                 del self.analyzers[cam_id]
+
+            # 从 go2rtc 移除流
+            self.go2rtc_manager.remove_stream(cam_id)
 
             self.shared.cameras = [
                 c for c in self.shared.cameras if c["id"] != cam_id
@@ -867,14 +902,23 @@ class Application:
     def reload_model(self, new_model_path: str) -> None:
         model_config = self.config.get("model", {})
         confidence = model_config.get("confidence", 0.5)
-        allowed_classes = model_config.get("classes")
+        detector_type = model_config.get("detector_type", "yolo")
 
         try:
-            new_detector = YOLODetector(
-                model_path=new_model_path,
-                confidence=confidence,
-                allowed_classes=allowed_classes,
-            )
+            if detector_type == "roboflow":
+                rf_cfg = model_config.get("roboflow", {})
+                new_detector = RoboflowDetector(
+                    model_id=new_model_path,  # 对 roboflow 来说 path 即 model_id
+                    confidence=confidence,
+                    allowed_classes=rf_cfg.get("classes") or None,
+                )
+            else:
+                allowed_classes = model_config.get("classes")
+                new_detector = YOLODetector(
+                    model_path=new_model_path,
+                    confidence=confidence,
+                    allowed_classes=allowed_classes,
+                )
         except Exception as e:
             logger.error(f"新模型加载失败，保持旧模型运行: {new_model_path}, 错误: {e}")
             return

@@ -149,6 +149,7 @@ class CameraConfigBody(BaseModel):
     id: str = ""
     name: str = ""
     url: str = ""
+    rtsp_url: str = ""  # 原始 RTSP 地址（自动注册到 go2rtc）
     width: int = 0
     height: int = 0
     fps: int = 15
@@ -296,8 +297,10 @@ async def get_camera_detail(camera_id: str):
 async def add_camera(body: CameraConfigBody):
     if _application is None:
         return JSONResponse({"error": "系统未初始化"}, status_code=500)
-    if not body.id or not body.url:
-        return JSONResponse({"error": "id 和 url 为必填项"}, status_code=400)
+    if not body.id:
+        return JSONResponse({"error": "id 为必填项"}, status_code=400)
+    if not body.rtsp_url and not body.url:
+        return JSONResponse({"error": "rtsp_url 或 url 至少填一个"}, status_code=400)
     existing = _application.get_camera_config(body.id)
     if existing:
         return JSONResponse({"error": f"摄像头 {body.id} 已存在"}, status_code=409)
@@ -317,8 +320,8 @@ async def add_camera(body: CameraConfigBody):
 async def update_camera(camera_id: str, body: CameraConfigBody):
     if _application is None:
         return JSONResponse({"error": "系统未初始化"}, status_code=500)
-    if not body.url:
-        return JSONResponse({"error": "url 为必填项"}, status_code=400)
+    if not body.rtsp_url and not body.url:
+        return JSONResponse({"error": "rtsp_url 或 url 至少填一个"}, status_code=400)
     cam_cfg = body.model_dump()
     cam_cfg["id"] = camera_id
     try:

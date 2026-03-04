@@ -1,22 +1,25 @@
 # 仓储安防视频分析系统
 
-基于 YOLO + ByteTrack 的多路摄像头实时视频分析系统，支持入侵检测、越线计数、行为异常检测、在线训练等功能。
+基于 YOLO / Roboflow RF-DETR + ByteTrack 的多路摄像头实时视频分析系统，支持入侵检测、越线计数、行为异常检测、在线训练等功能。
 
 ## 系统架构
 
 ```
-RTSP 摄像头 → 拉流(ffmpeg) → 运动预过滤 → YOLO 检测 + ByteTrack 跟踪
-                                                    ↓
-                                              规则引擎（入侵/越线/计数/异常/存在）
-                                                    ↓
-                                         事件存储(SQLite) + 截图 + WebSocket 推送
-                                                    ↓
-                                         React 前端（实时画面 / 事件 / 配置 / 训练）
+RTSP 摄像头 → go2rtc 流中转(规范化/透传) → ffmpeg 拉流 → 运动预过滤 → 目标检测(YOLO/RF-DETR) + ByteTrack 跟踪
+                                                                              ↓
+                                                                        规则引擎（入侵/越线/计数/异常/存在）
+                                                                              ↓
+                                                                   事件存储(SQLite) + 截图 + WebSocket 推送
+                                                                              ↓
+                                                                   React 前端（实时画面 / 事件 / 配置 / 训练）
 ```
 
 核心设计参考 Frigate：
+- go2rtc 流中转：所有摄像头流经 go2rtc 规范化后再拉取，减少对摄像头的直连数，提升兼容性
 - 运动检测作为预过滤，仅在有运动时运行 AI 推理，大幅降低 GPU/CPU 负载
-- 每路摄像头独立线程，多路共享同一个 YOLO 检测器实例
+- 每路摄像头独立线程，多路共享同一个检测器实例
+- 支持 YOLO 和 Roboflow RF-DETR 两种检测后端，通过配置一键切换
+- 添加/编辑摄像头时只需填原始 RTSP 地址，系统自动注册 go2rtc 并生成 restream 地址
 - 看门狗自动恢复崩溃的摄像头管线（指数退避）
 
 ## 功能一览
@@ -34,18 +37,32 @@ RTSP 摄像头 → 拉流(ffmpeg) → 运动预过滤 → YOLO 检测 + ByteTrac
 | 存在检测 | 目标出现/消失通知 |
 | 在线训练 | 数据集管理、标注、YOLO 训练、模型热重载 |
 
+## 检测器后端
+
+系统支持两种目标检测后端，通过 `model.detector_type` 配置切换：
+
+| 后端 | 说明 | 跟踪方式 | 类别配置 |
+|------|------|----------|----------|
+| `yolo`（默认） | Ultralytics YOLO 系列，轻量高速 | YOLO 内置 ByteTrack | COCO 类别 ID（如 `[0, 2, 7]`） |
+| `roboflow` | Roboflow RF-DETR（DETR 架构），精度更高 | supervision ByteTrack | 类别名称（如 `["person", "car"]`） |
+
+RF-DETR 可用模型：`rfdetr-base`、`rfdetr-large`、`rfdetr-nano`、`rfdetr-small`、`rfdetr-medium`、`rfdetr-seg-preview`
+
 ## 工程结构
 
 ```
 warehouse-vision/
 ├── configs/
-│   └── cameras.yaml            # 摄像头与规则配置（核心配置文件）
+│   ├── cameras.yaml            # 摄像头与规则配置（核心配置文件）
+│   └── go2rtc.yaml             # go2rtc 流中转配置（自动管理，一般无需手动编辑）
 ├── src/
-│   ├── app.py                  # 主程序调度（多线程管线 + 看门狗）
+│   ├── app.py                  # 主程序调度（多线程管线 + 看门狗 + go2rtc 集成）
 │   ├── config/schema.py        # Pydantic 配置模型
-│   ├── ingest/rtsp_reader.py   # RTSP 拉流（ffmpeg + TCP）
+│   ├── ingest/
+│   │   ├── rtsp_reader.py      # RTSP 拉流（ffmpeg + TCP，参考 Frigate）
+│   │   └── go2rtc.py           # go2rtc 流管理器（REST API + yaml 双写）
 │   ├── vision/
-│   │   ├── detector.py         # YOLO 检测 + ByteTrack 跟踪 + Pose
+│   │   ├── detector.py         # YOLO / Roboflow RF-DETR 检测 + ByteTrack 跟踪 + Pose
 │   │   └── motion.py           # 运动检测预过滤
 │   ├── rules/
 │   │   ├── geometry.py         # 几何运算（点线关系、多边形判定）
@@ -76,10 +93,12 @@ warehouse-vision/
 │       │   └── TrainingPage.tsx# 在线训练（数据集/标注/训练/模型）
 │       └── components/         # 通用组件
 ├── scripts/
-│   ├── run_all.py              # 启动全部服务（后端 + Web）
+│   ├── run_all.py              # 启动全部服务（go2rtc + 后端 + Web）
 │   ├── run_single_cam.py       # 单摄像头测试
 │   └── roi_selector.py         # ROI 点选工具
-├── Dockerfile                  # 多阶段构建（前端 + 后端 + GPU）
+├── Dockerfile                  # 多阶段构建（前端 + go2rtc + 后端 GPU）
+├── Dockerfile.cpu              # CPU 版 Dockerfile
+├── docker-compose.yml          # 一键部署（go2rtc 内嵌）
 ├── requirements.txt
 └── README.md
 ```
@@ -89,6 +108,7 @@ warehouse-vision/
 - Python 3.10+（推荐 3.12）
 - Node.js 18+（前端构建）
 - ffmpeg（RTSP 拉流）
+- go2rtc（流中转，Docker 镜像已内置；本地开发需单独下载）
 - GPU（可选，有 CUDA 显卡可加速推理）
 
 ## 本地运行
@@ -114,19 +134,33 @@ cd web
 npm install
 ```
 
-### 3. 配置摄像头
+### 3. 下载 go2rtc
 
-编辑 `configs/cameras.yaml`，配置 RTSP 地址和检测规则（详见下方配置说明）。
+从 [go2rtc releases](https://github.com/AlexxIT/go2rtc/releases) 下载对应平台的二进制文件，放到 `go2rtc/` 目录下：
 
-### 4. 启动后端
+- Windows: `go2rtc/go2rtc.exe`
+- Linux: `go2rtc/go2rtc`（需 `chmod +x`）
+
+启动脚本 `run_all.py` 会自动查找并启动 go2rtc。
+
+### 4. 配置摄像头
+
+编辑 `configs/cameras.yaml`，添加摄像头时只需填写 `rtsp_url`（原始 RTSP 地址），系统会自动：
+1. 将流注册到 go2rtc
+2. 生成 restream 地址（`rtsp://127.0.0.1:8555/<cam_id>`）作为实际拉流地址
+3. 同步更新 `configs/go2rtc.yaml`
+
+也可以通过前端配置页面或 API 添加摄像头，同样只需填原始 RTSP 地址。
+
+### 5. 启动后端
 
 ```bash
 python scripts/run_all.py
 ```
 
-后端启动后访问 http://localhost:8000
+启动顺序：go2rtc → 摄像头流同步 → 分析管线 → Web 服务。后端启动后访问 http://localhost:8000
 
-### 5. 启动前端（开发模式）
+### 6. 启动前端（开发模式）
 
 ```bash
 cd web
@@ -135,7 +169,7 @@ npm run dev
 
 前端开发服务器 http://localhost:5173，API 请求自动代理到后端。
 
-### 6. 构建前端（生产模式）
+### 7. 构建前端（生产模式）
 
 ```bash
 cd web
@@ -146,11 +180,17 @@ npm run build
 
 ## Docker 部署
 
+镜像采用三阶段构建：前端（Node.js）→ go2rtc（从 GitHub releases 下载 v1.9.14 二进制）→ Python 后端。go2rtc 内嵌在镜像中，由 `run_all.py` 统一启动管理，无需额外容器。
+
 ### docker-compose（推荐）
 
 ```bash
 # 构建并启动（GPU 模式，需要 nvidia-container-toolkit）
 docker-compose up -d --build
+
+# CPU 模式（使用 Dockerfile.cpu）
+docker-compose -f docker-compose.yml build --build-arg DOCKERFILE=Dockerfile.cpu
+# 或直接修改 docker-compose.yml 中 build 段并删除 deploy 段
 
 # 查看日志
 docker-compose logs -f
@@ -160,32 +200,31 @@ docker-compose down
 ```
 
 `docker-compose.yml` 已配置：
-- 端口映射 `8000:8000`（前端 + 后端统一入口）
+- `network_mode: host`（go2rtc RTSP restream 端口 8555 + Web 端口 8000 + go2rtc API 端口 1984）
 - 挂载卷：`configs/`（配置）、`data/`（数据库/模型/样本）、`events/`（截图/日志）
-- GPU 资源预留
-
-如不需要 GPU，删除 `docker-compose.yml` 中 `deploy` 段即可。
+- GPU 资源预留（如不需要 GPU，删除 `deploy` 段即可）
 
 ### docker run（手动）
 
 ```bash
-# CPU 模式
+# GPU 模式
 docker build -t warehouse-vision .
-docker run -d -p 8000:8000 \
+docker run -d --gpus all --network host \
   -v $(pwd)/configs:/app/configs \
   -v $(pwd)/data:/app/data \
   -v $(pwd)/events:/app/events \
   warehouse-vision
 
-# GPU 模式
-docker run -d --gpus all -p 8000:8000 \
+# CPU 模式
+docker build -f Dockerfile.cpu -t warehouse-vision-cpu .
+docker run -d --network host \
   -v $(pwd)/configs:/app/configs \
   -v $(pwd)/data:/app/data \
   -v $(pwd)/events:/app/events \
-  warehouse-vision
+  warehouse-vision-cpu
 ```
 
-启动后访问 http://localhost:8000 即可使用（前端已内置在镜像中）。
+启动后访问 http://localhost:8000 即可使用（前端已内置在镜像中）。go2rtc 调试面板可通过 http://localhost:1984 访问。
 
 ## 配置说明
 
@@ -197,7 +236,8 @@ docker run -d --gpus all -p 8000:8000 \
 cameras:
   - id: cam01                    # 唯一标识
     name: 停车场入口              # 显示名称
-    url: rtsp://...              # RTSP 地址
+    rtsp_url: rtsp://...         # 原始 RTSP 地址（自动注册到 go2rtc）
+    url: rtsp://127.0.0.1:8555/cam01  # 实际拉流地址（自动生成，无需手动填写）
     width: 1280
     height: 720
     fps: 15                      # 拉流帧率
@@ -261,12 +301,17 @@ cameras:
 
 ```yaml
 model:
-  path: yolo26m.pt               # YOLO 模型路径
-  confidence: 0.3                # 置信度阈值
-  analyze_fps: 5                 # 分析帧率（节流）
-  classes: [0, 1, 2, 3, 5, 7]   # 检测类别（COCO: person, bicycle, car, motorcycle, bus, truck）
+  detector_type: yolo               # 检测器类型: yolo 或 roboflow
+  path: yolo26m.pt                  # YOLO 模型路径（detector_type=yolo 时使用）
+  confidence: 0.3                   # 置信度阈值
+  analyze_fps: 5                    # 分析帧率（节流）
+  classes: [0, 1, 2, 3, 5, 7]      # YOLO 检测类别（COCO ID）
+  roboflow:                         # Roboflow 配置（detector_type=roboflow 时使用）
+    model_id: rfdetr-base           # 可选: rfdetr-base, rfdetr-large, rfdetr-nano,
+                                    #       rfdetr-small, rfdetr-medium, rfdetr-seg-preview
+    classes: []                     # 类别名称白名单（如 ["person", "car"]），空=全部
   pose:
-    enabled: true                # 启用姿态估计（打架/跌倒增强）
+    enabled: true                   # 启用姿态估计（打架/跌倒增强）
     path: yolo26m-pose.pt
     confidence: 0.3
 ```
@@ -277,6 +322,11 @@ model:
 web:
   host: 0.0.0.0
   port: 8000
+
+go2rtc:                           # go2rtc 流中转配置（可选，使用默认值即可）
+  api_url: http://127.0.0.1:1984  # go2rtc REST API 地址
+  rtsp_port: 8555                  # go2rtc RTSP restream 端口
+  config_path: configs/go2rtc.yaml # go2rtc 配置文件路径
 
 database:
   path: data/warehouse_vision.db  # SQLite 数据库路径
@@ -397,11 +447,17 @@ FileNotFoundError: [Errno 2] No such file or directory: 'ffmpeg'
 2. 检查用户名密码
 3. 用 VLC 测试 RTSP 地址是否可用
 4. 确认网络可达：`ping <摄像头IP>`
+5. 检查 go2rtc 是否正常运行：访问 http://localhost:1984 查看 go2rtc 调试面板
+6. 查看 go2rtc 日志确认流是否成功连接
 
 ### YOLO 模型下载失败
 
 首次运行会自动下载模型，如网络不通可手动下载 `.pt` 文件放到项目根目录。
 
+### RF-DETR 模型下载慢
+
+首次使用 Roboflow RF-DETR 时会自动下载权重文件（rfdetr-base 约 355MB），下载速度取决于网络环境。权重缓存在本地，后续启动无需重复下载。
+
 ### 端口被占用
 
-修改 `configs/cameras.yaml` 中 `web.port` 配置项。
+修改 `configs/cameras.yaml` 中 `web.port` 配置项。go2rtc 端口（1984/8555）在 `configs/go2rtc.yaml` 中配置。

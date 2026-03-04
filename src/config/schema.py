@@ -180,10 +180,23 @@ class CameraConfig(BaseModel):
 
 # ── 模型 ─────────────────────────────────────────────────────────────────────
 
+class RoboflowConfig(BaseModel):
+    """Roboflow RF-DETR 检测器配置"""
+    model_id: str = Field("rfdetr-base",
+                          description="RF-DETR 模型: rfdetr-base, rfdetr-large, rfdetr-nano, "
+                                      "rfdetr-small, rfdetr-medium, rfdetr-seg-preview")
+    classes: List[str] = Field(
+        default_factory=list,
+        description="检测类别名称白名单（如 ['person', 'car']），空=全部")
+
+
 class ModelConfig(BaseModel):
+    detector_type: str = Field("yolo",
+                               description="检测器类型: yolo 或 roboflow")
     path: str = "yolov8n.pt"
     confidence: float = Field(0.5, ge=0.0, le=1.0)
     classes: List[int] = Field(default_factory=lambda: [0, 1, 2, 3, 5, 7])
+    roboflow: RoboflowConfig = RoboflowConfig()
 
 
 # ── 事件 ─────────────────────────────────────────────────────────────────────

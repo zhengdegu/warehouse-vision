@@ -6,7 +6,13 @@ RUN npm ci
 COPY web/ .
 RUN npm run build
 
-# ── Stage 2: Python 后端 (CPU only) ──
+# ── Stage 2: 下载 go2rtc 二进制 ──
+FROM debian:bookworm-slim AS go2rtc
+ARG TARGETARCH
+ARG GO2RTC_VERSION=1.9.14
+ADD --chmod=755 "https://github.com/AlexxIT/go2rtc/releases/download/v${GO2RTC_VERSION}/go2rtc_linux_${TARGETARCH}" /usr/local/bin/go2rtc
+
+# ── Stage 3: Python 后端 (CPU only) ──
 FROM python:3.12-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -14,6 +20,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+
+# go2rtc 二进制
+COPY --from=go2rtc /usr/local/bin/go2rtc /usr/local/bin/go2rtc
 
 # 限制 CPU 推理线程，降低多核争抢
 ENV OMP_NUM_THREADS=2
@@ -31,6 +40,6 @@ COPY --from=frontend /web/dist web/dist
 
 RUN mkdir -p events data/samples data/labels data/models data/training data/metadata
 
-EXPOSE 8000
+EXPOSE 8000 1984 8555
 
 CMD ["python", "scripts/run_all.py"]

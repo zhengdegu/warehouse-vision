@@ -6,7 +6,13 @@ RUN npm ci
 COPY web/ .
 RUN npm run build
 
-# ── Stage 2: Python 后端 (GPU via PyTorch CUDA) ──
+# ── Stage 2: 下载 go2rtc 二进制 ──
+FROM debian:bookworm-slim AS go2rtc
+ARG TARGETARCH
+ARG GO2RTC_VERSION=1.9.14
+ADD --chmod=755 "https://github.com/AlexxIT/go2rtc/releases/download/v${GO2RTC_VERSION}/go2rtc_linux_${TARGETARCH}" /usr/local/bin/go2rtc
+
+# ── Stage 3: Python 后端 (GPU via PyTorch CUDA) ──
 FROM python:3.12-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -17,6 +23,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+
+# go2rtc 二进制
+COPY --from=go2rtc /usr/local/bin/go2rtc /usr/local/bin/go2rtc
 
 # PyTorch GPU 版 — pip 包自带 CUDA 运行时，无需 nvidia 基础镜像
 RUN pip install --no-cache-dir \
@@ -36,7 +45,7 @@ COPY --from=frontend /web/dist web/dist
 # 数据目录
 RUN mkdir -p events data/samples data/labels data/models data/training data/metadata
 
-EXPOSE 8000
+EXPOSE 8000 1984 8555
 
 # NVIDIA Container Runtime 环境变量
 ENV NVIDIA_VISIBLE_DEVICES=all
