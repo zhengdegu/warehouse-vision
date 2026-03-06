@@ -181,7 +181,7 @@ async def system_stats():
     if _shared_state:
         result["cameras"] = _shared_state.get_perf()
     if _application:
-        result["camera_count"] = len(_application.analyzers)
+        result["camera_count"] = len(_application._camera_groups)
     return JSONResponse(result)
 
 
@@ -191,16 +191,18 @@ async def system_health():
     healthy = True
     cameras_status = {}
     if _application:
-        for cam_id, analyzer in _application.analyzers.items():
-            is_running = analyzer._running
-            is_alive = analyzer.is_alive()
+        for cam_id, group in _application._camera_groups.items():
+            cap_alive = group.capture.is_alive()
+            ana_alive = group.analyzer.is_alive()
             cameras_status[cam_id] = {
-                "running": is_running,
-                "alive": is_alive,
-                "reader_active": analyzer.reader._running,
-                "crash_count": analyzer._crash_count,
+                "running": not group.stop_event.is_set(),
+                "alive": cap_alive and ana_alive,
+                "capture_alive": cap_alive,
+                "analyzer_alive": ana_alive,
+                "capture_pid": group.capture.pid,
+                "analyzer_pid": group.analyzer.pid,
             }
-            if not is_alive:
+            if not (cap_alive and ana_alive):
                 healthy = False
     return JSONResponse({
         "status": "healthy" if healthy else "degraded",
@@ -590,7 +592,7 @@ async def ws_events(websocket: WebSocket):
     try:
         while True:
             try:
-                await asyncio.wait_for(websocket.receive_text(), timeout=1.0)
+                await asyncio.wait_for(websocket.receive_text(), timeout=0.5)
             except asyncio.TimeoutError:
                 pass
             if _shared_state:
@@ -598,15 +600,8 @@ async def ws_events(websocket: WebSocket):
                     try:
                         event = _shared_state.event_queue.get_nowait()
                         msg = json.dumps(event, ensure_ascii=False)
-                        disconnected = []
-                        for client in _ws_clients:
-                            try:
-                                await client.send_text(msg)
-                            except Exception:
-                                disconnected.append(client)
-                        for c in disconnected:
-                            if c in _ws_clients:
-                                _ws_clients.remove(c)
+                        # 异步并发广播，避免单个慢客户端阻塞
+                        await _broadcast_ws(msg)
                     except Exception:
                         break
     except WebSocketDisconnect:
@@ -617,6 +612,29 @@ async def ws_events(websocket: WebSocket):
         if websocket in _ws_clients:
             _ws_clients.remove(websocket)
         logger.info(f"WebSocket 客户端断开，剩余 {len(_ws_clients)} 个")
+
+
+async def _broadcast_ws(msg: str):
+    """异步并发广播消息到所有 WebSocket 客户端"""
+    if not _ws_clients:
+        return
+    disconnected = []
+    tasks = []
+    for client in list(_ws_clients):
+        tasks.append(_safe_send(client, msg, disconnected))
+    if tasks:
+        await asyncio.gather(*tasks)
+    for c in disconnected:
+        if c in _ws_clients:
+            _ws_clients.remove(c)
+
+
+async def _safe_send(client: WebSocket, msg: str, disconnected: list):
+    """带超时的安全发送，避免慢客户端阻塞"""
+    try:
+        await asyncio.wait_for(client.send_text(msg), timeout=2.0)
+    except Exception:
+        disconnected.append(client)
 
 
 def run_server(shared_state, jsonl_logger, host: str = "0.0.0.0",

@@ -36,6 +36,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY src/ src/
 COPY scripts/ scripts/
 COPY configs/ configs/
+
+# 模型文件
+COPY yolo26m.pt .
+COPY yolo26m-pose.pt .
 COPY --from=frontend /web/dist web/dist
 
 RUN mkdir -p events data/samples data/labels data/models data/training data/metadata

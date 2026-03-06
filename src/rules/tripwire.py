@@ -3,10 +3,11 @@
 判断目标轨迹是否穿越 Tripwire 线段，支持方向判定。
 
 三层检测策略（由精确到宽松）:
-1. 逐帧跟踪: 有 track_id 时，前一帧 foot → 当前 foot
+1. 逐帧跟踪: 有 track_id 时，前一帧 foot → 当前 foot（统一用底边中点）
 2. 历史回溯: 有 track_id 时，首次出现位置 → 当前位置
 3. 侧边翻转: 无 track_id 时，用 bbox IoU 匹配 + 线段侧判断
-   解决快速目标 ByteTrack 来不及分配 ID 的问题
+
+每个 track_id 对同一条越线只触发一次（单次触发机制），避免重复计数。
 """
 
 import time
@@ -21,7 +22,7 @@ logger = logging.getLogger(__name__)
 _MAX_HISTORY = 30
 _TRACK_EXPIRE = 10.0
 
-# COCO 车辆类别 — 这些目标用 center 而非 foot 做越线判定
+# COCO 车辆类别
 _VEHICLE_CLASSES = {"car", "truck", "bus", "motorcycle", "bicycle"}
 
 
@@ -93,6 +94,7 @@ class TripwireDetector:
         # === 有 track_id 的跟踪数据 ===
         self._track_history: Dict[int, deque] = {}
         self._last_trigger: Dict[int, float] = {}
+        self._triggered_tracks: set = set()  # 已越线的 track_id，不再重复触发
         self._prev_foot: Dict[int, Point] = {}
         self._prev_center: Dict[int, Point] = {}
 
@@ -122,6 +124,7 @@ class TripwireDetector:
             self._prev_foot.pop(tid, None)
             self._prev_center.pop(tid, None)
             self._last_trigger.pop(tid, None)
+            self._triggered_tracks.discard(tid)
         # 清理过期的无跟踪记录
         self._untracked_prev = [
             e for e in self._untracked_prev if now - e.timestamp < 3.0
@@ -195,32 +198,36 @@ class TripwireDetector:
             tid = det.track_id
             curr_foot = det.foot
             curr_center = det.center
-            # 车辆用 center，行人用 foot
-            is_vehicle = det.class_name in _VEHICLE_CLASSES
-            curr_ref = curr_center if is_vehicle else curr_foot
+            # 统一用 foot（底边中点）做越线判定，更贴近地面，受透视影响小
+            curr_ref = curr_foot
 
             if tid not in self._track_history:
                 self._track_history[tid] = deque(maxlen=_MAX_HISTORY)
             self._track_history[tid].append((curr_foot, curr_center, now))
 
+            # 单次触发：每个 track_id 对同一条线只触发一次
+            if tid in self._triggered_tracks:
+                self._prev_foot[tid] = curr_foot
+                self._prev_center[tid] = curr_center
+                continue
+
+            # cooldown 仍保留作为短期防抖（防止同一帧多次判定）
             last = self._last_trigger.get(tid, 0)
             if now - last < self.cooldown:
                 self._prev_foot[tid] = curr_foot
                 self._prev_center[tid] = curr_center
-                # 在 cooldown 期间持续清空历史，防止 cooldown 结束后
-                # 策略2用旧的起始点重新触发越线
                 self._track_history[tid].clear()
                 continue
 
             crossing = "none"
 
-            # 策略1: 逐帧 — 车辆用 center，行人用 foot
-            prev_ref = self._prev_center.get(tid) if is_vehicle else self._prev_foot.get(tid)
+            # 策略1: 逐帧 foot → foot
+            prev_ref = self._prev_foot.get(tid)
             if prev_ref is not None:
                 crossing = line_crossing(prev_ref, curr_ref,
                                          self.p1, self.p2)
-            # 如果 foot 没检测到，也试 center（兜底）
-            if crossing == "none" and not is_vehicle:
+            # foot 没检测到时用 center 兜底
+            if crossing == "none":
                 prev_center = self._prev_center.get(tid)
                 if prev_center is not None:
                     crossing = line_crossing(prev_center, curr_center,
@@ -232,8 +239,7 @@ class TripwireDetector:
                     self._track_history[tid][0]
                 span = now - first_time
                 if 0.03 < span < 8.0:
-                    first_ref = first_center if is_vehicle else first_foot
-                    crossing = line_crossing(first_ref, curr_ref,
+                    crossing = line_crossing(first_foot, curr_ref,
                                              self.p1, self.p2)
                     if crossing == "none":
                         crossing = line_crossing(first_center, curr_center,
@@ -245,8 +251,8 @@ class TripwireDetector:
             if crossing != "none":
                 cross_dir = self._crossing_to_dir(crossing)
                 self._last_trigger[tid] = now
+                self._triggered_tracks.add(tid)  # 标记已触发，不再重复
                 self._track_history[tid].clear()
-                # 重置 prev 位置到当前位置，防止 cooldown 后用旧位置重新触发
                 self._prev_foot[tid] = curr_foot
                 self._prev_center[tid] = curr_center
                 # 触发 tracked 越线后，给同类别的 untracked 加冷却
@@ -264,8 +270,8 @@ class TripwireDetector:
 
             for det in untracked_dets:
                 is_vehicle = det.class_name in _VEHICLE_CLASSES
-                # 车辆用 center 判断侧边，行人用 foot
-                ref_point = det.center if is_vehicle else det.foot
+                # 统一用 foot 判断侧边
+                ref_point = det.foot
                 side = _side_of_line(ref_point, self.p1, self.p2)
                 center_side = _side_of_line(det.center, self.p1, self.p2)
                 entry = _UntrackEntry(det, side, center_side, now)
@@ -313,8 +319,8 @@ class TripwireDetector:
                             best_match_idx = idx
 
                 if best_match is not None:
-                    # 车辆优先用 center_side 比较，行人用 foot side
-                    prev_side = best_match.center_side if is_vehicle else best_match.side
+                    # 统一用 foot side 比较
+                    prev_side = best_match.side
                     if prev_side != 0:
                         cross_dir = self._side_flip_to_dir(prev_side, side)
                         if cross_dir is not None:
@@ -342,8 +348,8 @@ class TripwireDetector:
         if tracked_dets and not untracked_dets:
             new_entries = []
             for det in tracked_dets:
-                is_vehicle = det.class_name in _VEHICLE_CLASSES
-                ref_point = det.center if is_vehicle else det.foot
+                # 统一用 foot
+                ref_point = det.foot
                 side = _side_of_line(ref_point, self.p1, self.p2)
                 center_side = _side_of_line(det.center, self.p1, self.p2)
                 new_entries.append(_UntrackEntry(det, side, center_side, now))

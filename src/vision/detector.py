@@ -35,13 +35,15 @@ class YOLODetector:
 
     def __init__(self, model_path: str = "yolov8n.pt",
                  confidence: float = 0.5,
-                 allowed_classes: Optional[List[int]] = None):
+                 allowed_classes: Optional[List[int]] = None,
+                 tracker_config: str = "configs/bytetrack_sensitive.yaml"):
         from ultralytics import YOLO
         self.model = YOLO(model_path)
         self.model.to(DEVICE)
         self.confidence = confidence
         self.allowed_classes = allowed_classes
-        logger.info(f"YOLO 模型已加载: {model_path}, 设备: {DEVICE}, 白名单: {allowed_classes}")
+        self.tracker_config = tracker_config
+        logger.info(f"YOLO 模型已加载: {model_path}, 设备: {DEVICE}, 白名单: {allowed_classes}, tracker: {tracker_config}")
 
     def _parse_results(self, results, with_track: bool = False) -> List[Detection]:
         """解析 YOLO 结果为 Detection 列表"""
@@ -94,7 +96,7 @@ class YOLODetector:
             frame,
             conf=self.confidence,
             persist=True,
-            tracker="bytetrack.yaml",
+            tracker=self.tracker_config,
             device=DEVICE,
             verbose=False
         )
@@ -129,12 +131,14 @@ class PoseDetector:
     """
 
     def __init__(self, model_path: str = "yolo26m-pose.pt",
-                 confidence: float = 0.3):
+                 confidence: float = 0.3,
+                 tracker_config: str = "configs/bytetrack_sensitive.yaml"):
         from ultralytics import YOLO
         self.model = YOLO(model_path)
         self.model.to(DEVICE)
         self.confidence = confidence
-        logger.info(f"Pose 模型已加载: {model_path}, 设备: {DEVICE}")
+        self.tracker_config = tracker_config
+        logger.info(f"Pose 模型已加载: {model_path}, 设备: {DEVICE}, tracker: {tracker_config}")
 
     def detect(self, frame: np.ndarray) -> List[Detection]:
         """纯姿态检测，不跟踪"""
@@ -147,7 +151,7 @@ class PoseDetector:
             frame,
             conf=self.confidence,
             persist=True,
-            tracker="bytetrack.yaml",
+            tracker=self.tracker_config,
             device=DEVICE,
             verbose=False,
         )

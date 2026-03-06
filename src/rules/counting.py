@@ -17,7 +17,8 @@ logger = logging.getLogger(__name__)
 class FlowCounter:
     """流量计数器，滑动窗口聚合 + 今日统计"""
 
-    def __init__(self, camera_id: str, window_seconds: int = 60):
+    def __init__(self, camera_id: str, window_seconds: int = 60,
+                 db_path: str = "data/warehouse_vision.db"):
         self.camera_id = camera_id
         self.window_seconds = window_seconds
 
@@ -29,6 +30,9 @@ class FlowCounter:
         self.today_in = 0
         self.today_out = 0
         self._today_date = date.today()
+
+        # 从数据库恢复今日计数
+        self._recover_today_counts(db_path)
 
         # 滑动窗口：记录每个事件的 (timestamp, direction)
         self._recent_events: deque = deque()
@@ -50,6 +54,34 @@ class FlowCounter:
             self.today_in = 0
             self.today_out = 0
             self._today_date = today
+
+    def _recover_today_counts(self, db_path: str):
+        """从数据库恢复今日计数（重启后不丢失）"""
+        try:
+            import sqlite3
+            from datetime import datetime
+            today_start = datetime.combine(date.today(), datetime.min.time())
+            ts_start = today_start.timestamp()
+
+            conn = sqlite3.connect(db_path, timeout=5)
+            cur = conn.cursor()
+            # 从 count_windows 表恢复
+            cur.execute(
+                "SELECT COALESCE(SUM(window_in), 0), COALESCE(SUM(window_out), 0) "
+                "FROM count_windows WHERE camera_id = ? AND timestamp >= ?",
+                (self.camera_id, ts_start))
+            row = cur.fetchone()
+            if row:
+                self.today_in = int(row[0])
+                self.today_out = int(row[1])
+                self.total_in = self.today_in
+                self.total_out = self.today_out
+            conn.close()
+            if self.today_in > 0 or self.today_out > 0:
+                logger.info(f"[{self.camera_id}] 从 DB 恢复今日计数: "
+                            f"in={self.today_in}, out={self.today_out}")
+        except Exception as e:
+            logger.warning(f"[{self.camera_id}] 恢复今日计数失败: {e}")
 
     def _prune_old(self, now: float):
         """清理超出窗口的旧事件"""

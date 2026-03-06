@@ -249,7 +249,7 @@ class RTSPReader:
         帧捕获循环 — 严格对标 Frigate capture_frames()。
 
         从 ffmpeg stdout 读取固定大小的 YUV420P 帧，
-        转换为 BGR 后推入队列。
+        直接传递 YUV 帧（不做颜色转换，参考 Frigate 零转换设计）。
         """
         frame_size = self._frame_size
 
@@ -276,11 +276,12 @@ class RTSPReader:
                 # 更新最后收帧时间（看门狗用）
                 self._last_frame_time = time.time()
 
-                # YUV420P → BGR
-                yuv = np.frombuffer(raw, dtype=np.uint8).reshape(
+                # 保持 YUV420P 格式 — 对标 Frigate（全程 YUV，不做转换）
+                # YUV420P 布局: Y(h*w) + U(h/2*w/2) + V(h/2*w/2) = h*w*3/2
+                # reshape 为 (h*3/2, w) 的 2D 数组
+                yuv_frame = np.frombuffer(raw, dtype=np.uint8).reshape(
                     (self.height * 3 // 2, self.width)
                 )
-                frame = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
 
                 # 推入队列（丢弃旧帧，只保留最新帧）
                 capture_ts = time.time() + self._time_offset
@@ -289,7 +290,7 @@ class RTSPReader:
                 except Exception:
                     pass
                 try:
-                    self._queue.put_nowait((frame, capture_ts))
+                    self._queue.put_nowait((yuv_frame, capture_ts))
                 except Full:
                     pass
 

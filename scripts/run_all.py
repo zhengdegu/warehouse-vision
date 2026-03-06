@@ -1,6 +1,11 @@
 """
 主启动脚本
-启动 go2rtc 流中转 + 所有摄像头分析线程 + Web 服务。
+启动 go2rtc 流中转 + 多进程分析管线 + Web 服务。
+
+多进程架构（对标 Frigate）:
+- 每路摄像头: CaptureProcess + AnalyzerProcess（独立进程）
+- 检测器: DetectorProcess（独立进程，所有摄像头共享）
+- Web: FastAPI（主进程）
 """
 
 import sys
@@ -10,6 +15,7 @@ import logging
 import threading
 import subprocess
 import time
+import multiprocessing as mp
 
 # 添加项目根目录到 path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -104,6 +110,11 @@ def stop_go2rtc(proc: subprocess.Popen | None):
 
 
 def main():
+    # Windows 多进程必须: freeze_support + spawn
+    if sys.platform == "win32":
+        mp.freeze_support()
+    mp.set_start_method("spawn", force=True)
+
     config_path = os.environ.get("CONFIG", "configs/cameras.yaml")
     logger.info(f"配置文件: {config_path}")
 

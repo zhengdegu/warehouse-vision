@@ -28,6 +28,8 @@ class MotionConfig(BaseModel):
     threshold: int = Field(40, ge=1, le=255, description="像素差阈值")
     contour_area: int = Field(200, ge=10, description="最小轮廓面积(像素)")
     frame_alpha: float = Field(0.02, ge=0.001, le=1.0, description="背景更新速率")
+    frame_height: int = Field(100, ge=50, le=500,
+                              description="运动检测帧高度(像素)，越小越省CPU")
     mask: List[List[List[float]]] = Field(default_factory=list,
                                           description="运动遮罩多边形列表")
 

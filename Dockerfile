@@ -39,6 +39,10 @@ COPY src/ src/
 COPY scripts/ scripts/
 COPY configs/ configs/
 
+# 模型文件
+COPY yolo26m.pt .
+COPY yolo26m-pose.pt .
+
 # 前端构建产物
 COPY --from=frontend /web/dist web/dist
 

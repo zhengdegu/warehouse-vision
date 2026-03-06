@@ -550,6 +550,10 @@ class FallRule(BaseAnomalyRule):
                 # Pose 直接判定跌倒，不需要历史帧对比
                 is_fall = True
                 detail = f"疑似跌倒：姿态异常(头低于臀) [Pose增强]"
+            elif ratio > 1.3:
+                # 明显横躺姿态（宽远大于高），无需历史帧对比
+                is_fall = True
+                detail = f"疑似跌倒：横躺姿态(宽高比{ratio:.2f}) [静态检测]"
             elif prev_ratio is not None and prev_center is not None:
                 # 回退到 bbox 规则
                 ratio_change = ratio - prev_ratio

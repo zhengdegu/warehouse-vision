@@ -1,68 +1,113 @@
 """
 主程序调度模块 — 参考 Frigate 多进程架构
-视频管线: 拉流 → 运动检测 → 目标检测 → 规则引擎 → 事件处理
 
-核心优化:
-- 运动检测作为预过滤，只在有运动时运行 AI（大幅降低负载）
-- 每路摄像头独立线程，检测器独立实例
-- 共享状态通过线程安全缓存传递给 Web 层
-- SQLite 替代 JSONL，支持结构化查询
+视频管线: 拉流(进程) → 运动检测(进程) → 目标检测(进程) → 规则引擎 → 事件处理
+
+核心架构（对标 Frigate）:
+- 每路摄像头 2 个独立进程: CaptureProcess + AnalyzerProcess
+- 检测器 1 个独立进程: DetectorProcess（所有摄像头共享）
+- 进程间通信: 共享内存(帧) + Queue(通知/事件)
+- Web 层通过共享内存零拷贝读取 BGR 帧
+
+参考:
+- frigate/frigate/camera/maintainer.py: CameraMaintainer
+- frigate/frigate/video.py: CameraCapture, CameraTracker
+- frigate/frigate/object_detection/base.py: ObjectDetectProcess, DetectorRunner
 """
 
 import os
 import time
 import threading
 import logging
+import multiprocessing as mp
 from typing import Dict, Any, List, Optional
-from queue import Queue
+from queue import Empty
 
 import yaml
 import numpy as np
+import cv2
 
 from .config.schema import AppConfig, CameraConfig
-from .ingest.rtsp_reader import RTSPReader
 from .ingest.go2rtc import Go2RTCManager
-from .vision.detector import YOLODetector, Detection, PoseDetector, RoboflowDetector
-from .vision.motion import MotionDetector
-from .vision.inference_queue import InferenceQueue
-from .vision.stationary import StationaryTracker
-from .rules.intrusion import IntrusionDetector
-from .rules.tripwire import TripwireDetector
-from .rules.counting import FlowCounter
-from .rules.anomaly import AnomalyEngine
-from .rules.presence import PresenceDetector
-from .rules.area_counter import AreaCounter
-from .events.evidence import EvidenceSaver, draw_overlay
 from .events.logger import JSONLLogger
 from .events.database import EventDatabase
 from .events.es_store import ESEventStore
+from .mp.capture_process import CaptureProcess
+from .mp.analyzer_process import AnalyzerProcess
+from .mp.detector_process import DetectorProcess
 
 logger = logging.getLogger(__name__)
 
+# 共享内存帧缓冲区大小（对标 Frigate shm_frame_count）
+SHM_FRAME_COUNT = 10
+
+
 
 class SharedState:
-    """分析线程与 Web 层之间的共享状态"""
+    """
+    Web 层共享状态 — 从共享内存读取帧，从 Queue 接收事件。
+
+    与旧版的区别:
+    - 旧版: 分析线程直接写入 dict（线程锁保护）
+    - 新版: 帧通过共享内存读取，事件通过 Queue 接收
+    """
 
     def __init__(self):
-        self.latest_frame_cache: Dict[str, np.ndarray] = {}
-        self.count_cache: Dict[str, Dict[str, Any]] = {}
-        self.area_count_cache: Dict[str, Dict[str, Any]] = {}  # 区域内目标计数
-        self.event_queue: Queue = Queue(maxsize=1000)
         self.cameras: List[Dict[str, Any]] = []
-        # 系统性能指标
+        self.count_cache: Dict[str, Dict[str, Any]] = {}
+        self.area_count_cache: Dict[str, Dict[str, Any]] = {}
+        self.event_queue: mp.Queue = mp.Queue(maxsize=1000)
         self.perf_stats: Dict[str, Dict[str, Any]] = {}
-        self._frame_lock = threading.Lock()
+
+        # BGR 帧共享内存映射: {camera_id: (shm_name, shape)}
+        self._bgr_shm_info: Dict[str, tuple] = {}
+        self._bgr_shm_cache: Dict[str, Any] = {}
+
         self._count_lock = threading.Lock()
         self._area_count_lock = threading.Lock()
         self._perf_lock = threading.Lock()
 
-    def update_frame(self, camera_id: str, frame: np.ndarray):
-        with self._frame_lock:
-            self.latest_frame_cache[camera_id] = frame
+    def register_bgr_shm(self, camera_id: str, shm_name: str, shape: tuple):
+        """注册 BGR 帧共享内存信息"""
+        self._bgr_shm_info[camera_id] = (shm_name, shape)
 
     def get_frame(self, camera_id: str) -> Optional[np.ndarray]:
-        with self._frame_lock:
-            return self.latest_frame_cache.get(camera_id)
+        """从共享内存读取 BGR 帧（零拷贝 → copy 返回）"""
+        info = self._bgr_shm_info.get(camera_id)
+        if info is None:
+            return None
+
+        shm_name, shape = info
+        try:
+            if camera_id not in self._bgr_shm_cache:
+                from multiprocessing import shared_memory
+                shm = shared_memory.SharedMemory(name=shm_name, create=False)
+                self._bgr_shm_cache[camera_id] = shm
+
+            shm = self._bgr_shm_cache[camera_id]
+            frame = np.ndarray(shape, dtype=np.uint8, buffer=shm.buf)
+            return frame.copy()
+        except Exception:
+            # 共享内存可能还没创建
+            return None
+
+    def update_frame(self, camera_id: str, frame: np.ndarray):
+        """兼容旧接口 — 直接写入共享内存"""
+        info = self._bgr_shm_info.get(camera_id)
+        if info is None:
+            return
+        shm_name, shape = info
+        try:
+            if camera_id not in self._bgr_shm_cache:
+                from multiprocessing import shared_memory
+                shm = shared_memory.SharedMemory(name=shm_name, create=False)
+                self._bgr_shm_cache[camera_id] = shm
+            shm = self._bgr_shm_cache[camera_id]
+            target = np.ndarray(shape, dtype=np.uint8, buffer=shm.buf)
+            if frame.shape == shape:
+                np.copyto(target, frame)
+        except Exception:
+            pass
 
     def update_counts(self, camera_id: str, counts: Dict[str, Any]):
         with self._count_lock:
@@ -73,12 +118,10 @@ class SharedState:
             return dict(self.count_cache)
 
     def update_area_counts(self, camera_id: str, counts: Dict[str, Any]):
-        """更新区域内目标计数"""
         with self._area_count_lock:
             self.area_count_cache[camera_id] = counts
 
     def get_area_counts(self) -> Dict[str, Dict[str, Any]]:
-        """获取所有摄像头的区域内目标计数"""
         with self._area_count_lock:
             return dict(self.area_count_cache)
 
@@ -100,519 +143,14 @@ class SharedState:
             except Exception:
                 pass
 
-
-class CameraAnalyzer:
-    """
-    单路摄像头分析管线
-    Pipeline: 拉流 → 运动检测 → 目标检测(仅运动区域) → 规则引擎 → 事件
-    """
-
-    def __init__(self, cam_config: dict, model_config: dict,
-                 events_config: dict, shared: SharedState,
-                 jsonl_logger: JSONLLogger, event_db: EventDatabase,
-                 es_store: ESEventStore = None,
-                 detector: YOLODetector = None,
-                 pose_detector: PoseDetector = None,
-                 inference_queue: InferenceQueue = None):
-        self.cam_id = cam_config["id"]
-        self.cam_config = cam_config
-        self.shared = shared
-        self.jsonl_logger = jsonl_logger
-        self.event_db = event_db
-        self.es_store = es_store
-        self._running = False
-        self._thread: Optional[threading.Thread] = None
-
-        # 崩溃恢复状态
-        self._crash_count = 0
-        self._last_crash_time = 0.0
-        self._consecutive_errors = 0
-        self._max_consecutive_errors = 50  # 连续异常超过此数触发自动重启拉流
-
-        # 性能统计
-        self._frame_count = 0
-        self._detect_count = 0
-        self._skip_count = 0
-        self._last_stats_time = time.time()
-
-        # 分析帧率节流（降低 CPU 占用）
-        self._target_analyze_fps = cam_config.get("analyze_fps",
-                                                   model_config.get("analyze_fps", 5))
-        self._min_frame_interval = 1.0 / max(self._target_analyze_fps, 1)
-        self._last_analyze_time = 0.0
-
-        # RTSP 拉流（width/height 传 0 则自动探测）
-        # time_offset: 摄像头时间偏移（秒），None=自动探测，0=不修正
-        self.reader = RTSPReader(
-            url=cam_config["url"],
-            width=cam_config.get("width", 0),
-            height=cam_config.get("height", 0),
-            fps=cam_config.get("fps", 15),
-            time_offset=cam_config.get("time_offset"),
-        )
-
-        # 运动检测器 — Frigate 核心优化
-        motion_cfg = cam_config.get("motion", {})
-        from .config.schema import MotionConfig
-        self.motion_detector = MotionDetector(MotionConfig(**motion_cfg))
-
-        # YOLO 检测器 — 多摄像头共享同一实例，避免重复加载
-        if detector is not None:
-            self.detector = detector
-        else:
-            self.detector = YOLODetector(
-                model_path=model_config.get("path", "yolo26m.pt"),
-                confidence=model_config.get("confidence", 0.5),
-                allowed_classes=model_config.get("classes"),
-            )
-
-        # Pose 检测器（打架/跌倒姿态增强，可选）— 同样共享
-        pose_config = model_config.get("pose", {})
-        self.pose_detector = None
-        if pose_config.get("enabled", False):
-            if pose_detector is not None:
-                self.pose_detector = pose_detector
-            else:
-                self.pose_detector = PoseDetector(
-                    model_path=pose_config.get("path", "yolo26m-pose.pt"),
-                    confidence=pose_config.get("confidence", 0.3),
-                )
-
-        # 规则引擎
-        rules_cfg = cam_config.get("rules", {})
-        roi = cam_config.get("roi")
-
-        # 入侵检测
-        self.intrusion_detector = None
-        intrusion_cfg = rules_cfg.get("intrusion", {})
-        if roi and intrusion_cfg.get("enabled", False):
-            self.intrusion_detector = IntrusionDetector(
-                roi=roi,
-                confirm_frames=intrusion_cfg.get("confirm_frames", 5),
-                cooldown=intrusion_cfg.get("cooldown", 30),
-            )
-
-        # 越线检测
-        self.tripwire_detectors: List[TripwireDetector] = []
-        tripwires = cam_config.get("tripwires", [])
-        tw_cfg = rules_cfg.get("tripwire", {})
-        if tw_cfg.get("enabled", False):
-            for tw in tripwires:
-                self.tripwire_detectors.append(TripwireDetector(
-                    tripwire_id=tw["id"],
-                    name=tw["name"],
-                    p1=tw["p1"],
-                    p2=tw["p2"],
-                    direction=tw.get("direction", "left_to_right"),
-                    cooldown=tw.get("cooldown", 2.0),
-                ))
-
-        # 计数器
-        self.counter = None
-        count_cfg = rules_cfg.get("counting", {})
-        if count_cfg.get("enabled", False):
-            self.counter = FlowCounter(
-                camera_id=self.cam_id,
-                window_seconds=count_cfg.get("window_seconds", 60),
-            )
-            saved = event_db.get_camera_stats(self.cam_id)
-            if saved:
-                self.counter.total_in = saved.get("total_in", 0)
-                self.counter.total_out = saved.get("total_out", 0)
-
-        # 异常检测
-        anomaly_cfg = rules_cfg.get("anomaly", {})
-        self.anomaly_engine = AnomalyEngine(anomaly_cfg, roi=roi)
-
-        # 存在检测
-        presence_cfg = rules_cfg.get("presence", {})
-        self.presence_detector = PresenceDetector(
-            watch_classes=presence_cfg.get("watch_classes", [0, 2, 3, 5, 7]),
-            cooldown=presence_cfg.get("cooldown", 10),
-            min_confidence=presence_cfg.get("min_confidence", 0.5),
-            roi=roi,
-        )
-
-        # 区域内目标计数
-        self.area_counter = AreaCounter(roi=roi)
-
-        # 截图保存
-        self.evidence_saver = EvidenceSaver(
-            output_dir=events_config.get("output_dir", "events"),
-            draw_bbox=events_config.get("draw_bbox", True),
-            draw_roi=events_config.get("draw_roi", True),
-            draw_tripwire=events_config.get("draw_tripwire", True),
-        )
-
-        self._roi = roi
-        self._tripwires = tripwires
-
-        # 告警类型过滤：空列表=全部告警，否则只有匹配的类型才触发告警
-        # 支持格式: "tripwire", "intrusion", "presence", "anomaly/dwell" 等
-        self._alert_types: list = rules_cfg.get("alert_types", [])
-
-        # 推理队列（所有摄像头共享，串行推理）
-        self._inference_queue = inference_queue
-
-        # 静止目标跟踪器（每路摄像头独立）
-        stationary_cfg = cam_config.get("stationary", {})
-        self._stationary_tracker = StationaryTracker(
-            move_threshold=stationary_cfg.get("move_threshold", 20.0),
-            stationary_frames=stationary_cfg.get("stationary_frames", 15),
-            recheck_interval=stationary_cfg.get("recheck_interval", 30),
-        )
-
-        # 区域裁剪送检配置
-        self._crop_margin = cam_config.get("crop_margin", 50)  # 裁剪区域外扩像素
-
-
-
-    def _crop_motion_region(self, frame: np.ndarray,
-                            motion_boxes) -> tuple:
-        """
-        区域裁剪送检：合并所有运动框为一个大区域，裁剪后返回。
-        如果运动区域覆盖大部分画面（>60%），直接返回原帧。
-
-        返回: (cropped_frame, (offset_x, offset_y)) 或 (original_frame, (0, 0))
-        """
-        h, w = frame.shape[:2]
-
-        if not motion_boxes:
-            return frame, (0, 0)
-
-        # 合并所有运动框为一个包围框
-        x1 = min(mb.x1 for mb in motion_boxes)
-        y1 = min(mb.y1 for mb in motion_boxes)
-        x2 = max(mb.x2 for mb in motion_boxes)
-        y2 = max(mb.y2 for mb in motion_boxes)
-
-        # 外扩 margin
-        margin = self._crop_margin
-        x1 = max(0, x1 - margin)
-        y1 = max(0, y1 - margin)
-        x2 = min(w, x2 + margin)
-        y2 = min(h, y2 + margin)
-
-        crop_w = x2 - x1
-        crop_h = y2 - y1
-
-        # 如果裁剪区域 > 60% 原帧面积，不裁剪（收益太小）
-        if (crop_w * crop_h) > (w * h * 0.6):
-            return frame, (0, 0)
-
-        cropped = frame[y1:y2, x1:x2]
-        return cropped, (x1, y1)
-
-    @staticmethod
-    def _remap_detections(detections, offset: tuple):
-        """将裁剪区域内的检测坐标映射回原始帧坐标"""
-        ox, oy = offset
-        if ox == 0 and oy == 0:
-            return detections
-
-        for det in detections:
-            det.bbox[0] += ox
-            det.bbox[1] += oy
-            det.bbox[2] += ox
-            det.bbox[3] += oy
-            cx, cy = det.center
-            det.center = (cx + ox, cy + oy)
-            fx, fy = det.foot
-            det.foot = (fx + ox, fy + oy)
-        return detections
-
-    def _should_alert(self, evt: dict) -> bool:
-        """
-        判断事件是否应触发告警。
-        alert_types 为空 → 全部告警
-        否则匹配 "tripwire", "intrusion", "presence", "anomaly/dwell" 等
-        """
-        if not self._alert_types:
-            return True  # 未配置 = 全部告警
-
-        evt_type = evt.get("type", "")
-        sub_type = evt.get("sub_type", "")
-
-        for at in self._alert_types:
-            # 精确匹配: "tripwire", "intrusion"
-            if at == evt_type:
-                return True
-            # 子类型匹配: "anomaly/dwell"
-            if "/" in at:
-                t, s = at.split("/", 1)
-                if t == evt_type and s == sub_type:
-                    return True
-
-        return False
-
-    def _update_perf_stats(self):
-        """更新性能统计"""
-        now = time.time()
-        elapsed = now - self._last_stats_time
-        if elapsed < 5:
-            return
-        fps = self._frame_count / elapsed
-        det_fps = self._detect_count / elapsed
-        skip_rate = (self._skip_count / max(self._frame_count, 1)) * 100
-
-        self.shared.update_perf(self.cam_id, {
-            "fps": round(fps, 1),
-            "detection_fps": round(det_fps, 1),
-            "skip_rate": round(skip_rate, 1),
-            "frames_processed": self._frame_count,
-            "detections_run": self._detect_count,
-            "stationary_objects": self._stationary_tracker.stationary_count,
-            "tracked_objects": self._stationary_tracker.tracked_count,
-        })
-
-        self._frame_count = 0
-        self._detect_count = 0
-        self._skip_count = 0
-        self._last_stats_time = now
-
-    def _analyze_loop(self):
-        """分析主循环 — 带运动预过滤 + 帧率节流 + 崩溃自恢复"""
-        logger.info(f"[{self.cam_id}] 分析管线启动 (目标分析帧率: {self._target_analyze_fps} fps)")
-        no_frame_count = 0
-        # RTSPReader 内部有看门狗（20秒无帧自动重启 ffmpeg），
-        # 这里只需要处理分析层面的长时间无帧（reader 本身可能在重连中）
-        warmup_until = time.time() + 30.0
-
-        while self._running:
+    def cleanup_shm(self):
+        """清理共享内存缓存"""
+        for shm in self._bgr_shm_cache.values():
             try:
-                frame, frame_ts = self.reader.read_latest()
-                if frame is None:
-                    no_frame_count += 1
-                    # 长时间无帧 → 拉流可能挂了，触发 reader 重启
-                    # 宽限期内不重启，避免 ffmpeg 还没连上就被杀掉
-                    if no_frame_count > 300 and time.time() > warmup_until:
-                        logger.warning(f"[{self.cam_id}] 长时间无帧，重启拉流")
-                        self._restart_reader()
-                        no_frame_count = 0
-                        warmup_until = time.time() + 30.0
-                    time.sleep(0.01)
-                    continue
-
-                no_frame_count = 0
-                self._consecutive_errors = 0
-
-                # 帧率节流：控制分析频率，避免 CPU 空转
-                now = time.time()
-                elapsed_since_last = now - self._last_analyze_time
-                if elapsed_since_last < self._min_frame_interval:
-                    self.shared.update_frame(self.cam_id, frame)
-                    time.sleep(max(0, self._min_frame_interval - elapsed_since_last))
-                    continue
-                self._last_analyze_time = now
-
-                self._frame_count += 1
-
-                # ① 运动检测（低开销预过滤）
-                motion_boxes, has_motion = self.motion_detector.detect(frame)
-
-                if not has_motion:
-                    self._skip_count += 1
-                    # 即使无运动，也要更新静止目标的 recheck 计数
-                    self._stationary_tracker.update([])
-                    self.shared.update_frame(self.cam_id, frame)
-                    self._update_perf_stats()
-                    continue
-
-                # ② 静止目标过滤 — 复用未移动目标的检测结果
-                stationary_dets, need_detect = \
-                    self._stationary_tracker.get_stationary_detections(motion_boxes)
-
-                if not need_detect and stationary_dets:
-                    # 所有目标都是静止的，跳过推理
-                    self._skip_count += 1
-                    detections = stationary_dets
-                else:
-                    # ③ 目标检测 + 跟踪
-                    self._detect_count += 1
-
-                    # 区域裁剪送检：将运动区域合并为一个大区域，裁剪后送检
-                    # 注意：ByteTrack 需要一致的帧输入来维护跟踪状态，
-                    # 所以我们裁剪后在裁剪区域上运行 track()，再映射回原坐标
-                    crop_frame, crop_offset = self._crop_motion_region(
-                        frame, motion_boxes)
-
-                    try:
-                        if self._inference_queue:
-                            raw_dets = self._inference_queue.submit(
-                                crop_frame, self.cam_id, "track")
-                        else:
-                            raw_dets = self.detector.track(crop_frame)
-
-                        # 将裁剪坐标映射回原始帧坐标
-                        detections = self._remap_detections(
-                            raw_dets, crop_offset)
-                    except Exception as det_err:
-                        logger.error(f"[{self.cam_id}] 检测异常: {det_err}",
-                                     exc_info=True)
-                        detections = []
-
-                    # 合并静止目标（它们跳过了本次推理）
-                    if stationary_dets:
-                        detected_ids = {d.track_id for d in detections
-                                        if d.track_id >= 0}
-                        for sd in stationary_dets:
-                            if sd.track_id not in detected_ids:
-                                detections.append(sd)
-
-                # 更新静止目标跟踪器
-                self._stationary_tracker.update(detections)
-
-                # ③-b Pose 检测（可选，为打架/跌倒提供关键点）
-                if self.pose_detector and detections:
-                    try:
-                        if self._inference_queue:
-                            pose_dets = self._inference_queue.submit(
-                                frame, self.cam_id, "pose_track")
-                        else:
-                            pose_dets = self.pose_detector.track(frame)
-                        pose_map = {d.track_id: d.keypoints
-                                    for d in pose_dets
-                                    if d.track_id >= 0 and d.keypoints is not None}
-                        if pose_map:
-                            for det in detections:
-                                if det.class_name == "person" and det.track_id in pose_map:
-                                    det.keypoints = pose_map[det.track_id]
-                    except Exception as pose_err:
-                        logger.error(f"[{self.cam_id}] Pose 检测异常: {pose_err}",
-                                     exc_info=True)
-
-                all_events = []
-
-                # ③ 规则引擎
-                if self.intrusion_detector:
-                    events = self.intrusion_detector.update(
-                        detections, self.cam_id, frame_ts=frame_ts)
-                    all_events.extend(events)
-
-                tw_events = []
-                for tw_det in self.tripwire_detectors:
-                    events = tw_det.update(detections, self.cam_id,
-                                           frame_ts=frame_ts)
-                    tw_events.extend(events)
-                all_events.extend(tw_events)
-
-                if self.counter:
-                    count_results = self.counter.update(tw_events)
-                    for cr in count_results:
-                        self.jsonl_logger.log_count(cr)
-                        self.event_db.insert_count_window(cr)
-                    counts = self.counter.get_current_counts()
-                    self.shared.update_counts(self.cam_id, counts)
-                    if tw_events:
-                        self.jsonl_logger.update_counts(
-                            self.cam_id, counts["total_in"], counts["total_out"])
-                        self.event_db.update_camera_stats(
-                            self.cam_id, counts["total_in"], counts["total_out"])
-
-                anomaly_events = self.anomaly_engine.update(
-                    detections, self.cam_id, frame_ts=frame_ts)
-                all_events.extend(anomaly_events)
-
-                presence_events = self.presence_detector.update(
-                    detections, self.cam_id, frame_ts=frame_ts)
-                all_events.extend(presence_events)
-
-                # 更新区域内目标计数
-                self.area_counter.update(detections)
-                area_counts = self.area_counter.get_counts()
-                self.shared.update_area_counts(self.cam_id, area_counts)
-                
-                # 定期记录区域计数到数据库
-                area_record = self.area_counter.maybe_record(self.cam_id)
-                if area_record:
-                    self.event_db.insert_area_count(area_record)
-
-                # ④ 事件处理（区分记录 vs 告警）
-                for evt in all_events:
-                    is_alert = self._should_alert(evt)
-
-                    if is_alert:
-                        try:
-                            filepath = self.evidence_saver.save_screenshot(
-                                frame, evt,
-                                roi=self._roi,
-                                tripwires=self._tripwires,
-                                detections=detections,
-                            )
-                            evt["screenshot"] = os.path.basename(filepath)
-                        except Exception as e:
-                            logger.error(f"截图保存失败: {e}")
-
-                        self.jsonl_logger.log_event(evt)
-                        self.event_db.update_camera_stats(
-                            self.cam_id, increment_alert=True)
-                        self.shared.push_event(evt)
-
-                        if self.es_store:
-                            self.es_store.store_event(evt)
-
-                    self.event_db.insert_event(evt)
-
-                # ⑤ 更新 Web 展示帧
-                try:
-                    overlay_frame = draw_overlay(
-                        frame, detections,
-                        roi=self._roi,
-                        tripwires=self._tripwires,
-                    )
-                    self.shared.update_frame(self.cam_id, overlay_frame)
-                except Exception:
-                    self.shared.update_frame(self.cam_id, frame)
-
-                self._update_perf_stats()
-
-            except Exception as e:
-                self._consecutive_errors += 1
-                logger.error(f"[{self.cam_id}] 分析异常 (连续第{self._consecutive_errors}次): {e}",
-                             exc_info=True)
-
-                if self._consecutive_errors >= self._max_consecutive_errors:
-                    logger.error(f"[{self.cam_id}] 连续异常过多，重启拉流")
-                    self._restart_reader()
-                    self._consecutive_errors = 0
-
-                time.sleep(0.5)
-
-        logger.info(f"[{self.cam_id}] 分析管线退出")
-
-    def _restart_reader(self):
-        """安全重启拉流进程"""
-        try:
-            self.reader.stop()
-        except Exception:
-            pass
-        time.sleep(1)
-        try:
-            self.reader.start()
-            logger.info(f"[{self.cam_id}] 拉流已重启")
-        except Exception as e:
-            logger.error(f"[{self.cam_id}] 拉流重启失败: {e}")
-
-    def start(self):
-        self._running = True
-        self._crash_count = 0
-        self.reader.start()
-        self._thread = threading.Thread(
-            target=self._analyze_loop, daemon=True,
-            name=f"analyzer-{self.cam_id}")
-        self._thread.start()
-
-    def stop(self):
-        self._running = False
-        self.reader.stop()
-        if self._thread:
-            self._thread.join(timeout=10)
-
-    def is_alive(self) -> bool:
-        """检查分析线程是否存活"""
-        return (self._running
-                and self._thread is not None
-                and self._thread.is_alive())
+                shm.close()
+            except Exception:
+                pass
+        self._bgr_shm_cache.clear()
 
 
 def load_config(config_path: str = "configs/cameras.yaml") -> dict:
@@ -625,8 +163,139 @@ def save_config(config: dict, config_path: str = "configs/cameras.yaml"):
         yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
 
 
+
+class CameraProcessGroup:
+    """
+    单路摄像头的进程组 — 对标 Frigate CameraMaintainer 中的 per-camera 管理。
+
+    包含:
+    - CaptureProcess: ffmpeg 拉流 + 写共享内存
+    - AnalyzerProcess: 运动检测 + 规则引擎
+    - 相关的 Queue 和共享内存
+    """
+
+    def __init__(self, cam_config: dict, model_config: dict,
+                 events_config: dict,
+                 detect_queue: mp.Queue,
+                 result_queue: mp.Queue,
+                 event_queue: mp.Queue,
+                 perf_dict: dict,
+                 stop_event: mp.Event,
+                 db_path: str):
+        self.cam_id = cam_config["id"]
+        self.cam_config = cam_config
+        self.stop_event = stop_event
+
+        cam_w = cam_config.get("width", 0)
+        cam_h = cam_config.get("height", 0)
+        fps = cam_config.get("fps", 15)
+
+        # 帧通知队列: capture → analyzer
+        self.frame_queue = mp.Queue(maxsize=SHM_FRAME_COUNT)
+
+        # BGR 共享内存（analyzer 写入，Web 读取）
+        # 如果分辨率未知，先用默认值，capture 探测后会更新
+        bgr_h = cam_h if cam_h > 0 else 720
+        bgr_w = cam_w if cam_w > 0 else 1280
+        self.bgr_shm_name = f"wv_bgr_{self.cam_id}"
+        self.bgr_shm_shape = (bgr_h, bgr_w, 3)
+        bgr_size = bgr_h * bgr_w * 3
+
+        # 预创建 BGR 共享内存
+        from multiprocessing import shared_memory
+        try:
+            self._bgr_shm = shared_memory.SharedMemory(
+                name=self.bgr_shm_name, create=True, size=bgr_size)
+        except FileExistsError:
+            self._bgr_shm = shared_memory.SharedMemory(
+                name=self.bgr_shm_name, create=False)
+
+        # CaptureProcess
+        self.capture = CaptureProcess(
+            camera_id=self.cam_id,
+            url=cam_config["url"],
+            width=cam_w,
+            height=cam_h,
+            fps=fps,
+            shm_frame_count=SHM_FRAME_COUNT,
+            frame_queue=self.frame_queue,
+            stop_event=self.stop_event,
+            use_restream=True,
+            time_offset=cam_config.get("time_offset", 0.0) or 0.0,
+        )
+
+        # AnalyzerProcess
+        self.analyzer = AnalyzerProcess(
+            cam_config=cam_config,
+            model_config=model_config,
+            events_config=events_config,
+            frame_queue=self.frame_queue,
+            detect_queue=detect_queue,
+            result_queue=result_queue,
+            event_queue=event_queue,
+            perf_dict=perf_dict,
+            bgr_shm_name=self.bgr_shm_name,
+            bgr_shm_shape=self.bgr_shm_shape,
+            stop_event=self.stop_event,
+            db_path=db_path,
+        )
+
+    def start(self):
+        """启动 capture + analyzer 进程"""
+        self.capture.start()
+        self.analyzer.start()
+        logger.info(
+            f"[{self.cam_id}] 进程组已启动 "
+            f"(capture pid={self.capture.pid}, "
+            f"analyzer pid={self.analyzer.pid})")
+
+    def stop(self):
+        """停止进程组"""
+        self.stop_event.set()
+        if self.capture.is_alive():
+            self.capture.terminate()
+            self.capture.join(timeout=10)
+        if self.analyzer.is_alive():
+            self.analyzer.terminate()
+            self.analyzer.join(timeout=10)
+        # 清理 BGR 共享内存
+        try:
+            self._bgr_shm.close()
+            self._bgr_shm.unlink()
+        except Exception:
+            pass
+        logger.info(f"[{self.cam_id}] 进程组已停止")
+
+    def is_alive(self) -> bool:
+        return self.capture.is_alive() and self.analyzer.is_alive()
+
+
+
 class Application:
-    """主应用 — 管理所有摄像头管线和共享资源"""
+    """
+    主应用 — 对标 Frigate CameraMaintainer + AppRunner。
+
+    管理所有摄像头进程组和检测器进程。
+
+    架构:
+    ┌─────────────────────────────────────────────────────────┐
+    │ 主进程 (Application)                                     │
+    │  ├─ Web Server (FastAPI)                                 │
+    │  ├─ Event Dispatcher (从 event_queue 读取事件)           │
+    │  └─ Watchdog (监控子进程健康)                             │
+    ├─────────────────────────────────────────────────────────┤
+    │ DetectorProcess (独立进程)                                │
+    │  └─ 加载模型 → 从 detect_queue 取请求 → 推理 → 返回结果  │
+    ├─────────────────────────────────────────────────────────┤
+    │ Camera 1:                                                │
+    │  ├─ CaptureProcess: ffmpeg → 共享内存                    │
+    │  └─ AnalyzerProcess: 运动检测 → 检测 → 规则 → 事件      │
+    ├─────────────────────────────────────────────────────────┤
+    │ Camera 2:                                                │
+    │  ├─ CaptureProcess                                       │
+    │  └─ AnalyzerProcess                                      │
+    └─────────────────────────────────────────────────────────┘
+    """
 
     def __init__(self, config_path: str = "configs/cameras.yaml"):
         self.config_path = config_path
@@ -637,10 +306,10 @@ class Application:
 
         # SQLite 事件数据库
         db_cfg = self.config.get("database", {})
-        self.event_db = EventDatabase(
-            db_path=db_cfg.get("path", "data/warehouse_vision.db"))
+        self.db_path = db_cfg.get("path", "data/warehouse_vision.db")
+        self.event_db = EventDatabase(db_path=self.db_path)
 
-        # Elasticsearch 告警存储
+        # Elasticsearch
         es_cfg = self.config.get("elasticsearch", {})
         self.es_store = ESEventStore(
             host=es_cfg.get("host", "http://localhost:9222"),
@@ -656,16 +325,35 @@ class Application:
             config_path=go2rtc_cfg.get("config_path", "configs/go2rtc.yaml"),
         )
 
-        self.analyzers: Dict[str, CameraAnalyzer] = {}
+        # 多进程共享资源
+        self._manager = mp.Manager()
+        self._perf_dict = self._manager.dict()  # 性能指标共享
+
+        # 检测请求队列（所有摄像头 → 检测器）
+        self._detect_queue = mp.Queue(maxsize=32)
+
+        # 检测结果队列 — per-camera 隔离，避免 stash 竞争
+        self._result_queues: Dict[str, mp.Queue] = {}
+
+        # 事件队列（所有 analyzer → 主进程）
+        self._event_queue = mp.Queue(maxsize=1000)
+
+        # 全局停止信号
+        self._stop_event = mp.Event()
+
+        # 摄像头进程组
+        self._camera_groups: Dict[str, CameraProcessGroup] = {}
         self._lock = threading.Lock()
-        self._cleanup_thread: Optional[threading.Thread] = None
+
+        # 看门狗
         self._watchdog_thread: Optional[threading.Thread] = None
         self._watchdog_running = False
+        self._event_dispatcher_thread: Optional[threading.Thread] = None
 
         cameras = self.config.get("cameras", [])
         self.shared.cameras = cameras
 
-        # 启动时同步：将所有摄像头的 rtsp_url 注册到 go2rtc
+        # 同步 go2rtc
         for cam_cfg in cameras:
             rtsp_url = cam_cfg.get("rtsp_url", "")
             if rtsp_url:
@@ -674,50 +362,47 @@ class Application:
         model_config = self.config.get("model", {})
         events_config = self.config.get("events", {})
 
-        # 共享模型实例 — 所有摄像头复用同一个检测器，避免重复加载
-        detector_type = model_config.get("detector_type", "yolo")
-        if detector_type == "roboflow":
-            rf_cfg = model_config.get("roboflow", {})
-            self._shared_detector = RoboflowDetector(
-                model_id=rf_cfg.get("model_id", "rfdetr-base"),
-                confidence=model_config.get("confidence", 0.5),
-                allowed_classes=rf_cfg.get("classes") or None,
-            )
-        else:
-            self._shared_detector = YOLODetector(
-                model_path=model_config.get("path", "yolo26m.pt"),
-                confidence=model_config.get("confidence", 0.5),
-                allowed_classes=model_config.get("classes"),
-            )
-        self._shared_pose_detector = None
-        pose_config = model_config.get("pose", {})
-        if pose_config.get("enabled", False):
-            self._shared_pose_detector = PoseDetector(
-                model_path=pose_config.get("path", "yolo26m-pose.pt"),
-                confidence=pose_config.get("confidence", 0.3),
-            )
+        # 创建摄像头进程组
+        for cam_cfg in cameras:
+            self._create_camera_group(cam_cfg, model_config, events_config)
 
-        # 推理队列 — 所有摄像头共享，串行推理避免 CPU 争抢
-        self._inference_queue = InferenceQueue(
-            detector=self._shared_detector,
-            pose_detector=self._shared_pose_detector,
-            max_queue_size=len(cameras) * 2 + 4,
+        # 检测器进程
+        self._detector_process = DetectorProcess(
+            detector_config=model_config,
+            detect_queue=self._detect_queue,
+            result_queues=self._result_queues,
+            stop_event=self._stop_event,
         )
 
-        for cam_cfg in cameras:
-            analyzer = CameraAnalyzer(
-                cam_config=cam_cfg,
-                model_config=model_config,
-                events_config=events_config,
-                shared=self.shared,
-                jsonl_logger=self.jsonl_logger,
-                event_db=self.event_db,
-                es_store=self.es_store,
-                detector=self._shared_detector,
-                pose_detector=self._shared_pose_detector,
-                inference_queue=self._inference_queue,
-            )
-            self.analyzers[cam_cfg["id"]] = analyzer
+    def _create_camera_group(self, cam_cfg: dict, model_config: dict,
+                              events_config: dict):
+        """创建单路摄像头的进程组"""
+        cam_id = cam_cfg["id"]
+
+        # 每路摄像头独立的停止信号
+        cam_stop = mp.Event()
+
+        # per-camera result_queue
+        if cam_id not in self._result_queues:
+            self._result_queues[cam_id] = mp.Queue(maxsize=32)
+
+        group = CameraProcessGroup(
+            cam_config=cam_cfg,
+            model_config=model_config,
+            events_config=events_config,
+            detect_queue=self._detect_queue,
+            result_queue=self._result_queues[cam_id],
+            event_queue=self._event_queue,
+            perf_dict=self._perf_dict,
+            stop_event=cam_stop,
+            db_path=self.db_path,
+        )
+
+        self._camera_groups[cam_id] = group
+
+        # 注册 BGR 共享内存到 SharedState
+        self.shared.register_bgr_shm(
+            cam_id, group.bgr_shm_name, group.bgr_shm_shape)
 
     def _persist_config(self):
         self.config["cameras"] = list(self.shared.cameras)
@@ -726,33 +411,25 @@ class Application:
     def add_camera(self, cam_cfg: dict):
         cam_id = cam_cfg["id"]
 
-        # go2rtc 自动管理：如果提供了 rtsp_url，注册到 go2rtc 并自动设置 restream url
+        # go2rtc 管理
         rtsp_url = cam_cfg.get("rtsp_url", "")
         if rtsp_url:
             self.go2rtc_manager.add_stream(cam_id, rtsp_url)
             cam_cfg["url"] = self.go2rtc_manager.get_restream_url(cam_id)
 
         with self._lock:
-            if cam_id in self.analyzers:
-                self.analyzers[cam_id].stop()
+            # 停止旧进程组
+            if cam_id in self._camera_groups:
+                self._camera_groups[cam_id].stop()
+                del self._camera_groups[cam_id]
 
             model_config = self.config.get("model", {})
             events_config = self.config.get("events", {})
 
-            analyzer = CameraAnalyzer(
-                cam_config=cam_cfg,
-                model_config=model_config,
-                events_config=events_config,
-                shared=self.shared,
-                jsonl_logger=self.jsonl_logger,
-                event_db=self.event_db,
-                es_store=self.es_store,
-                detector=self._shared_detector,
-                pose_detector=self._shared_pose_detector,
-                inference_queue=self._inference_queue,
-            )
-            self.analyzers[cam_id] = analyzer
-            analyzer.start()
+            self._create_camera_group(cam_cfg, model_config, events_config)
+
+            # 启动新进程组
+            self._camera_groups[cam_id].start()
 
             self.shared.cameras = [
                 c for c in self.shared.cameras if c["id"] != cam_id
@@ -770,17 +447,18 @@ class Application:
 
     def remove_camera(self, cam_id: str):
         with self._lock:
-            if cam_id in self.analyzers:
-                self.analyzers[cam_id].stop()
-                del self.analyzers[cam_id]
+            if cam_id in self._camera_groups:
+                self._camera_groups[cam_id].stop()
+                del self._camera_groups[cam_id]
 
-            # 从 go2rtc 移除流
+            # 清理 per-camera result_queue
+            self._result_queues.pop(cam_id, None)
+
             self.go2rtc_manager.remove_stream(cam_id)
 
             self.shared.cameras = [
                 c for c in self.shared.cameras if c["id"] != cam_id
             ]
-            self.shared.latest_frame_cache.pop(cam_id, None)
             self.shared.count_cache.pop(cam_id, None)
             self._persist_config()
 
@@ -797,151 +475,220 @@ class Application:
         return list(self.shared.cameras)
 
     def start(self):
-        logger.info(f"启动 {len(self.analyzers)} 路摄像头分析管线")
-        # 先启动推理队列
-        self._inference_queue.start()
-        for analyzer in self.analyzers.values():
-            analyzer.start()
-        # 同步摄像头配置到 ES
+        logger.info(f"启动多进程架构: {len(self._camera_groups)} 路摄像头")
+
+        # 启动检测器进程
+        self._detector_process.start()
+        logger.info(f"检测器进程已启动 (pid={self._detector_process.pid})")
+
+        # 启动所有摄像头进程组
+        for group in self._camera_groups.values():
+            group.start()
+
+        # 同步 ES
         for cam_cfg in self.shared.cameras:
             self.es_store.store_camera_config(cam_cfg)
-        # 启动看门狗 + 定期清理
+
+        # 启动事件分发线程
+        self._start_event_dispatcher()
+
+        # 启动看门狗
         self._start_watchdog()
+
+        # 启动定期清理
         self._start_cleanup_thread()
+
+        logger.info("所有进程已启动")
+
+    def _start_event_dispatcher(self):
+        """
+        事件分发线程 — 从 event_queue 读取事件，分发到 SharedState。
+
+        analyzer 进程通过 event_queue 发送:
+        - 普通事件 → push_event (WebSocket 推送)
+        - _count_update → 更新 count_cache
+        - _area_count_update → 更新 area_count_cache
+        """
+        def _dispatch_loop():
+            while not self._stop_event.is_set():
+                try:
+                    evt = self._event_queue.get(timeout=1)
+                except Exception:
+                    continue
+
+                if evt is None:
+                    continue
+
+                evt_type = evt.get("_type", "")
+
+                if evt_type == "_count_update":
+                    self.shared.update_counts(
+                        evt["camera_id"], evt["counts"])
+                elif evt_type == "_area_count_update":
+                    self.shared.update_area_counts(
+                        evt["camera_id"], evt["counts"])
+                elif evt_type == "_perf_update":
+                    self.shared.update_perf(
+                        evt["camera_id"], evt["stats"])
+                else:
+                    # 普通告警事件
+                    self.shared.push_event(evt)
+                    if self.es_store:
+                        self.es_store.store_event(evt)
+
+                # 同步性能指标
+                try:
+                    for cam_id, stats in dict(self._perf_dict).items():
+                        self.shared.update_perf(cam_id, stats)
+                except Exception:
+                    pass
+
+        self._event_dispatcher_thread = threading.Thread(
+            target=_dispatch_loop, daemon=True, name="event-dispatcher")
+        self._event_dispatcher_thread.start()
 
     def _start_watchdog(self):
         """
-        看门狗线程：每 10 秒检查所有摄像头分析线程，
-        崩溃的自动重建并重启，带指数退避防止频繁重启。
+        看门狗 — 对标 Frigate CameraMaintainer.run() 中的进程监控。
+
+        每 10 秒检查所有子进程，崩溃的自动重启。
         """
         self._watchdog_running = True
 
         def _watchdog_loop():
             logger.info("看门狗已启动，监控间隔 10s")
-            while self._watchdog_running:
+            crash_counts: Dict[str, int] = {}
+
+            while self._watchdog_running and not self._stop_event.is_set():
                 time.sleep(10)
-                with self._lock:
-                    for cam_id, analyzer in list(self.analyzers.items()):
-                        if not analyzer._running:
-                            # 被主动 stop 的，不恢复
-                            continue
-                        if analyzer.is_alive():
-                            continue
 
-                        # 线程已死但 _running 仍为 True → 崩溃了
-                        analyzer._crash_count += 1
-                        analyzer._last_crash_time = time.time()
-
-                        # 指数退避：2^n 秒，最大 120 秒
-                        backoff = min(2 ** analyzer._crash_count, 120)
-                        logger.warning(
-                            f"[看门狗] {cam_id} 分析线程已崩溃 "
-                            f"(第{analyzer._crash_count}次)，"
-                            f"{backoff}s 后重启"
+                # 检查检测器进程
+                if not self._detector_process.is_alive():
+                    logger.error("检测器进程已崩溃，重启...")
+                    try:
+                        self._detector_process = DetectorProcess(
+                            detector_config=self.config.get("model", {}),
+                            detect_queue=self._detect_queue,
+                            result_queues=self._result_queues,
+                            stop_event=self._stop_event,
                         )
+                        self._detector_process.start()
+                        logger.info(f"检测器进程已重启 (pid={self._detector_process.pid})")
+                    except Exception as e:
+                        logger.error(f"检测器重启失败: {e}")
+
+                # 检查摄像头进程组
+                with self._lock:
+                    for cam_id, group in list(self._camera_groups.items()):
+                        if group.stop_event.is_set():
+                            continue  # 被主动停止的
+
+                        if group.is_alive():
+                            crash_counts[cam_id] = 0
+                            continue
+
+                        # 进程崩溃
+                        crash_counts[cam_id] = crash_counts.get(cam_id, 0) + 1
+                        count = crash_counts[cam_id]
+                        backoff = min(2 ** count, 120)
+
+                        logger.warning(
+                            f"[看门狗] {cam_id} 进程崩溃 "
+                            f"(第{count}次)，{backoff}s 后重启")
                         time.sleep(backoff)
 
-                        # 重建分析器
                         try:
-                            self._recover_analyzer(cam_id, analyzer)
+                            self._recover_camera(cam_id)
                         except Exception as e:
-                            logger.error(
-                                f"[看门狗] {cam_id} 恢复失败: {e}",
-                                exc_info=True
-                            )
+                            logger.error(f"[看门狗] {cam_id} 恢复失败: {e}")
 
         self._watchdog_thread = threading.Thread(
             target=_watchdog_loop, daemon=True, name="watchdog")
         self._watchdog_thread.start()
 
-    def _recover_analyzer(self, cam_id: str, old_analyzer: 'CameraAnalyzer'):
-        """重建并重启一个崩溃的摄像头分析器"""
-        crash_count = old_analyzer._crash_count
+    def _recover_camera(self, cam_id: str):
+        """重建并重启崩溃的摄像头进程组"""
+        old_group = self._camera_groups.get(cam_id)
+        if old_group:
+            try:
+                old_group.stop()
+            except Exception:
+                pass
 
-        # 先清理旧的
-        try:
-            old_analyzer.stop()
-        except Exception:
-            pass
+        cam_cfg = self.get_camera_config(cam_id)
+        if cam_cfg is None:
+            return
 
-        # 用原始配置重建
         model_config = self.config.get("model", {})
         events_config = self.config.get("events", {})
 
-        new_analyzer = CameraAnalyzer(
-            cam_config=old_analyzer.cam_config,
-            model_config=model_config,
-            events_config=events_config,
-            shared=self.shared,
-            jsonl_logger=self.jsonl_logger,
-            event_db=self.event_db,
-            es_store=self.es_store,
-            detector=self._shared_detector,
-            pose_detector=self._shared_pose_detector,
-        )
-        # 继承崩溃计数
-        new_analyzer._crash_count = crash_count
-
-        self.analyzers[cam_id] = new_analyzer
-        new_analyzer.start()
-        logger.info(f"[看门狗] {cam_id} 已恢复启动 (累计崩溃{crash_count}次)")
+        self._create_camera_group(cam_cfg, model_config, events_config)
+        self._camera_groups[cam_id].start()
+        logger.info(f"[看门狗] {cam_id} 已恢复启动")
 
     def _start_cleanup_thread(self):
-        """定期清理过期数据"""
         def _cleanup_loop():
-            while True:
-                time.sleep(3600)  # 每小时清理一次
+            while not self._stop_event.is_set():
+                time.sleep(3600)
                 try:
                     self.event_db.cleanup_old_events(retain_days=30)
                 except Exception as e:
                     logger.error(f"清理过期数据失败: {e}")
-        self._cleanup_thread = threading.Thread(
-            target=_cleanup_loop, daemon=True)
-        self._cleanup_thread.start()
+        threading.Thread(target=_cleanup_loop, daemon=True).start()
 
     def reload_model(self, new_model_path: str) -> None:
+        """
+        模型热重载 — 重启检测器进程。
+
+        与旧版的区别: 旧版替换对象引用，新版重启整个检测器进程。
+        """
         model_config = self.config.get("model", {})
-        confidence = model_config.get("confidence", 0.5)
-        detector_type = model_config.get("detector_type", "yolo")
 
-        try:
-            if detector_type == "roboflow":
-                rf_cfg = model_config.get("roboflow", {})
-                new_detector = RoboflowDetector(
-                    model_id=new_model_path,  # 对 roboflow 来说 path 即 model_id
-                    confidence=confidence,
-                    allowed_classes=rf_cfg.get("classes") or None,
-                )
-            else:
-                allowed_classes = model_config.get("classes")
-                new_detector = YOLODetector(
-                    model_path=new_model_path,
-                    confidence=confidence,
-                    allowed_classes=allowed_classes,
-                )
-        except Exception as e:
-            logger.error(f"新模型加载失败，保持旧模型运行: {new_model_path}, 错误: {e}")
-            return
+        # 更新配置
+        if model_config.get("detector_type", "yolo") == "roboflow":
+            model_config.setdefault("roboflow", {})["model_id"] = new_model_path
+        else:
+            model_config["path"] = new_model_path
 
-        with self._lock:
-            self._shared_detector = new_detector
-            # 更新推理队列中的检测器
-            self._inference_queue.detector = new_detector
-            for cam_id, analyzer in self.analyzers.items():
-                analyzer.detector = new_detector
-                logger.info(f"[{cam_id}] 检测器已替换为新模型: {new_model_path}")
+        # 停止旧检测器进程
+        if self._detector_process.is_alive():
+            self._detector_process.terminate()
+            self._detector_process.join(timeout=10)
 
-            if "model" not in self.config:
-                self.config["model"] = {}
-            self.config["model"]["path"] = new_model_path
-            self._persist_config()
+        # 启动新检测器进程
+        self._detector_process = DetectorProcess(
+            detector_config=model_config,
+            detect_queue=self._detect_queue,
+            result_queues=self._result_queues,
+            stop_event=self._stop_event,
+        )
+        self._detector_process.start()
 
+        self.config["model"] = model_config
+        self._persist_config()
         logger.info(f"模型热重载完成: {new_model_path}")
 
     def stop(self):
-        logger.info("停止所有分析管线...")
+        logger.info("停止所有进程...")
         self._watchdog_running = False
-        for analyzer in self.analyzers.values():
-            analyzer.stop()
-        self._inference_queue.stop()
-        logger.info("所有分析管线已停止")
+        self._stop_event.set()
+
+        # 停止所有摄像头进程组
+        for group in self._camera_groups.values():
+            group.stop()
+
+        # 停止检测器进程
+        if self._detector_process.is_alive():
+            self._detector_process.terminate()
+            self._detector_process.join(timeout=10)
+
+        # 清理共享内存
+        self.shared.cleanup_shm()
+
+        # 清理 Manager
+        try:
+            self._manager.shutdown()
+        except Exception:
+            pass
+
+        logger.info("所有进程已停止")

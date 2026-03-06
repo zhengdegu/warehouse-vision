@@ -30,6 +30,7 @@ class PresenceDetector:
         self.cooldown = cooldown
         self.min_confidence = min_confidence
         self._last_trigger: Dict[int, float] = {}
+        self._max_tracked = 500  # 最大跟踪数，防止内存泄漏
         # ROI 多边形，设置后只检测区域内的目标
         self.roi = [(float(p[0]), float(p[1])) for p in roi] if roi else None
 
@@ -74,10 +75,16 @@ class PresenceDetector:
             logger.info(f"[存在检测] cam={camera_id} track={det.track_id} "
                         f"class={label} conf={det.confidence:.2f}")
 
-        # 清理过期 track
+        # 清理过期 track + 容量限制
         expired = [k for k, v in self._last_trigger.items()
-                   if now - v > self.cooldown * 5]
+                   if now - v > self.cooldown * 3]
         for k in expired:
             del self._last_trigger[k]
+        # 硬上限：超过最大容量时清理最旧的
+        if len(self._last_trigger) > self._max_tracked:
+            sorted_items = sorted(self._last_trigger.items(), key=lambda x: x[1])
+            to_remove = len(self._last_trigger) - self._max_tracked // 2
+            for k, _ in sorted_items[:to_remove]:
+                del self._last_trigger[k]
 
         return events
