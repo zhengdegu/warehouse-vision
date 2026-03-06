@@ -7,7 +7,12 @@ __pycache__/
 
 # Models (large files)
 *.pt
+*.pth
 *.onnx
+
+# Large binaries
+go2rtc/
+data/eval_videos/
 
 # Data
 data/warehouse_vision.db
@@ -33,6 +38,7 @@ web/dist/
 # IDE
 .vscode/
 .kiro/
+.idea/
 
 # OS
 .DS_Store
