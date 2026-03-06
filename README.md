@@ -2,25 +2,55 @@
 
 基于 YOLO / Roboflow RF-DETR + ByteTrack 的多路摄像头实时视频分析系统，支持入侵检测、越线计数、行为异常检测、在线训练等功能。
 
+## 检测效果展示
+
+以下截图来自系统实际运行中的事件记录，包含检测框、ROI 区域、绊线等叠加信息：
+
+| 入侵检测 | 越线检测 |
+|:---:|:---:|
+| ![入侵检测](docs/screenshots/intrusion_detection.jpg) | ![越线检测](docs/screenshots/tripwire_detection.jpg) |
+
+| 异常行为检测 | 存在检测 |
+|:---:|:---:|
+| ![异常检测](docs/screenshots/anomaly_detection.jpg) | ![存在检测](docs/screenshots/presence_detection.jpg) |
+
+| 多摄像头监控 | 多场景异常检测 |
+|:---:|:---:|
+| ![多摄像头](docs/screenshots/multi_camera.jpg) | ![多场景异常](docs/screenshots/anomaly_cam03.jpg) |
+
 ## 系统架构
 
 ```
-RTSP 摄像头 → go2rtc 流中转(规范化/透传) → ffmpeg 拉流 → 运动预过滤 → 目标检测(YOLO/RF-DETR) + ByteTrack 跟踪
-                                                                              ↓
-                                                                        规则引擎（入侵/越线/计数/异常/存在）
-                                                                              ↓
-                                                                   事件存储(SQLite) + 截图 + WebSocket 推送
-                                                                              ↓
-                                                                   React 前端（实时画面 / 事件 / 配置 / 训练）
+┌─────────────────────────────────────────────────────────────────────┐
+│ 主进程 (Application)                                                │
+│  ├─ FastAPI Web Server (REST + WebSocket + MJPEG)                   │
+│  ├─ Event Dispatcher (event_queue → SharedState → WebSocket 推送)   │
+│  └─ Watchdog (监控子进程健康，崩溃自动重启)                          │
+├─────────────────────────────────────────────────────────────────────┤
+│ DetectorProcess (独立进程，所有摄像头共享)                            │
+│  └─ per-camera YOLO 模型实例 → 隔离 ByteTrack 状态                  │
+├─────────────────────────────────────────────────────────────────────┤
+│ Camera N:                                                           │
+│  ├─ CaptureProcess: RTSP → go2rtc → ffmpeg → 共享内存 (YUV)        │
+│  └─ AnalyzerProcess: 运动检测 → RemoteDetector → 规则引擎 → 事件   │
+└─────────────────────────────────────────────────────────────────────┘
+
+进程间通信:
+  帧数据: 共享内存 (零拷贝)
+  检测请求/结果: per-camera Queue (隔离，无竞争)
+  事件通知: event_queue → 主进程分发
+  BGR 展示帧: 共享内存 → Web MJPEG 编码
 ```
 
 核心设计参考 Frigate：
 - go2rtc 流中转：所有摄像头流经 go2rtc 规范化后再拉取，减少对摄像头的直连数，提升兼容性
 - 运动检测作为预过滤，仅在有运动时运行 AI 推理，大幅降低 GPU/CPU 负载
-- 每路摄像头独立线程，多路共享同一个检测器实例
+- 多进程架构：每路摄像头独立 Capture + Analyzer 进程，共享一个 Detector 进程（per-camera 模型实例隔离 ByteTrack 状态）
+- 进程间通信：共享内存传帧（零拷贝）+ Queue 传通知/事件，per-camera result_queue 消除竞争
 - 支持 YOLO 和 Roboflow RF-DETR 两种检测后端，通过配置一键切换
 - 添加/编辑摄像头时只需填原始 RTSP 地址，系统自动注册 go2rtc 并生成 restream 地址
 - 看门狗自动恢复崩溃的摄像头管线（指数退避）
+- 流量计数从数据库恢复今日统计（重启不丢失）
 
 ## 功能一览
 
@@ -96,6 +126,8 @@ warehouse-vision/
 │   ├── run_all.py              # 启动全部服务（go2rtc + 后端 + Web）
 │   ├── run_single_cam.py       # 单摄像头测试
 │   └── roi_selector.py         # ROI 点选工具
+├── docs/
+│   └── screenshots/            # README 展示用的事件截图
 ├── Dockerfile                  # 多阶段构建（前端 + go2rtc + 后端 GPU）
 ├── Dockerfile.cpu              # CPU 版 Dockerfile
 ├── docker-compose.yml          # 一键部署（go2rtc 内嵌）
@@ -222,6 +254,26 @@ docker run -d --network host \
   -v $(pwd)/data:/app/data \
   -v $(pwd)/events:/app/events \
   warehouse-vision-cpu
+```
+
+### 预构建镜像
+
+```bash
+# GPU 版本（含 CUDA 运行时，约 3.6GB）
+docker pull fastg/warehouse-vision:gpu-20260306
+docker run -d --gpus all --network host \
+  -v $(pwd)/configs:/app/configs \
+  -v $(pwd)/data:/app/data \
+  -v $(pwd)/events:/app/events \
+  fastg/warehouse-vision:gpu-20260306
+
+# CPU 版本（约 854MB）
+docker pull fastg/warehouse-vision:cpu-20260306v2
+docker run -d --network host \
+  -v $(pwd)/configs:/app/configs \
+  -v $(pwd)/data:/app/data \
+  -v $(pwd)/events:/app/events \
+  fastg/warehouse-vision:cpu-20260306v2
 ```
 
 启动后访问 http://localhost:8000 即可使用（前端已内置在镜像中）。go2rtc 调试面板可通过 http://localhost:1984 访问。
